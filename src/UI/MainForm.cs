@@ -108,7 +108,7 @@ namespace Discphew.UI
             var drivePanel = new Panel { Dock = DockStyle.Bottom, Height = Theme.S(196), BackColor = Theme.Sidebar };
             var driveLabel = new Caption("DRIVE", Theme.Small, Theme.Faint) { Bounds = new Rectangle(Theme.S(16), Theme.S(8), Theme.S(200), Theme.S(20)) };
             driveBox = new Dropdown { Bounds = new Rectangle(Theme.S(14), Theme.S(32), Theme.S(240 - 28 - 42 - 6), Theme.S(36)) };
-            driveBox.Format = o => o is char c ? CdDrive.Describe(c) : "";
+            driveBox.Format = o => o is char c ? state.DriveName(c) : "";
             driveBox.SelectedIndexChanged += (s, e) => { if (driveBox.SelectedItem is char c) state.SelectDrive(c); };
             ejectButton = new FlatButton("", Icons.Eject) { Bounds = new Rectangle(driveBox.Right + Theme.S(6), Theme.S(32), Theme.S(42), Theme.S(36)) };
             ejectButton.Click += (s, e) => Eject();
@@ -148,6 +148,7 @@ namespace Discphew.UI
             AddTool(navPanel, "Play", Icons.Note, new PlayerView(state));
 
             state.Changed += OnStateChanged;
+            state.LabelsChanged += () => driveBox.Invalidate();
             deviceDebounce.Tick += (s, e) => { deviceDebounce.Stop(); if (!state.Busy) { RefreshDriveList(); state.DrivesChanged(); } };
 
             int saved = Settings.GetInt("tool", 0);

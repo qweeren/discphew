@@ -14,6 +14,9 @@ namespace Discphew.Native
         public const uint FILE_ATTRIBUTE_NORMAL = 0x80;
         public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 
+        public const int ERROR_NOT_READY = 21;
+        public const int ERROR_MEDIA_CHANGED = 1110;
+
         // CTL_CODE(FILE_DEVICE_CD_ROM, fn, method, FILE_READ_ACCESS)
         public const uint IOCTL_CDROM_READ_TOC = 0x00024000;
         public const uint IOCTL_CDROM_GET_LAST_SESSION = 0x00024038;

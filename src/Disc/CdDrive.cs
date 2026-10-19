@@ -14,6 +14,9 @@ namespace Discphew.Disc
     {
         public DiscException(string message) : base(message) { }
         public DiscException(string message, Exception inner) : base(message, inner) { }
+
+        /// <summary>The drive is still spinning up or settling after a disc change: worth trying again shortly.</summary>
+        public bool NotReady { get; set; }
     }
 
     /// <summary>
@@ -38,16 +41,19 @@ namespace Discphew.Disc
         public static char[] Enumerate() =>
             DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.CDRom).Select(d => char.ToUpperInvariant(d.Name[0])).ToArray();
 
-        public static string Describe(char letter)
+        /// <summary>The volume label Windows reports, or "". Blocks while the drive spins up, so keep it off the UI thread.</summary>
+        public static string VolumeLabel(char letter)
         {
             try
             {
                 var di = new DriveInfo(letter + ":\\");
-                if (di.IsReady && !string.IsNullOrEmpty(di.VolumeLabel)) return $"{letter}:  {di.VolumeLabel}";
+                if (di.IsReady) return di.VolumeLabel ?? "";
             }
             catch { }
-            return $"{letter}:";
+            return "";
         }
+
+        public static bool IsNotReady(int win32Error) => win32Error == Win32.ERROR_NOT_READY || win32Error == Win32.ERROR_MEDIA_CHANGED;
 
         public CdDrive(char letter)
         {
@@ -72,7 +78,19 @@ namespace Discphew.Disc
         bool Ioctl(uint code, int inSize, int outSize, out int returned) =>
             Win32.DeviceIoControl(handle, code, inSize > 0 ? ioBuffer : IntPtr.Zero, inSize, outSize > 0 ? ioBuffer : IntPtr.Zero, outSize, out returned, IntPtr.Zero);
 
-        public bool MediaPresent() => Ioctl(Win32.IOCTL_STORAGE_CHECK_VERIFY, 0, 0, out _);
+        /// <summary>
+        /// The first check after a disc goes in reports "media changed" rather than success; that
+        /// still means a disc is there, so ask again to clear it.
+        /// </summary>
+        public bool MediaPresent()
+        {
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (Ioctl(Win32.IOCTL_STORAGE_CHECK_VERIFY, 0, 0, out _)) return true;
+                if (Marshal.GetLastWin32Error() != Win32.ERROR_MEDIA_CHANGED) return false;
+            }
+            return true;
+        }
 
         public static void Eject(char letter)
         {
@@ -95,7 +113,10 @@ namespace Discphew.Disc
             if (!MediaPresent()) throw new DiscException("No disc in the drive.");
             const int tocSize = 4 + 100 * 8;
             if (!Ioctl(Win32.IOCTL_CDROM_READ_TOC, 0, tocSize, out _))
-                throw new DiscException("Couldn't read the disc's table of contents. " + new Win32Exception().Message);
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new DiscException("Couldn't read the disc's table of contents. " + new Win32Exception(error).Message) { NotReady = IsNotReady(error) };
+            }
 
             var toc = new byte[tocSize];
             Marshal.Copy(ioBuffer, toc, 0, tocSize);

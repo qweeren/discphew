@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Discphew.Disc;
@@ -10,8 +13,11 @@ namespace Discphew.UI
     sealed class AppState
     {
         readonly Control ui;
+        readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer { Interval = 2000 };
+        readonly Dictionary<char, string> labels = new Dictionary<char, string>();
         int generation;
         string busyReason;
+        bool polling, mediaSeen, labelsPending;
 
         public char Drive { get; private set; }
         public DiscInfo Disc { get; private set; }
@@ -24,9 +30,21 @@ namespace Discphew.UI
         /// <summary>Raised on the UI thread whenever anything above changes.</summary>
         public event Action Changed;
 
-        public AppState(Control ui) { this.ui = ui; }
+        /// <summary>Raised on the UI thread when the drives' volume labels have been re-read.</summary>
+        public event Action LabelsChanged;
+
+        public AppState(Control ui)
+        {
+            this.ui = ui;
+            poll.Tick += (s, e) => Poll();
+            poll.Start();
+        }
 
         public char[] Drives => CdDrive.Enumerate();
+
+        /// <summary>"E:  LABEL" from the last time the labels were read. Never touches the drive.</summary>
+        public string DriveName(char letter) =>
+            labels.TryGetValue(letter, out var label) && label.Length > 0 ? $"{letter}:  {label}" : $"{letter}:";
 
         void Raise() => Changed?.Invoke();
 
@@ -64,27 +82,18 @@ namespace Discphew.UI
                 DiscInfo disc = null;
                 string message = "";
                 bool present = false;
-                try
+                // Right after a disc goes in, the drive answers "not ready" for a few seconds while it spins up.
+                var deadline = DateTime.UtcNow.AddSeconds(30);
+                while (true)
                 {
-                    using var drive = new CdDrive(letter);
-                    present = drive.MediaPresent();
-                    if (!present) message = "No disc in the drive.";
-                    else
+                    try { (disc, message, present) = ReadDrive(letter); break; }
+                    catch (Exception e) when (IsNotReady(e) && DateTime.UtcNow < deadline)
                     {
-                        try
-                        {
-                            disc = drive.ReadDisc();
-                            if (disc.HasData) disc.FileSystem = FileSystemReader.Read(drive, disc);
-                            if (disc.HasAudio) MetadataCache.Load(disc);
-                        }
-                        catch (DiscException)
-                        {
-                            disc = new DiscInfo { Drive = letter };     // blank or unreadable: IMAPI can still tell us what it is
-                            message = "No readable tracks (blank disc?)";
-                        }
+                        Thread.Sleep(1000);
+                        if (gen != Volatile.Read(ref generation)) return;
                     }
+                    catch (Exception e) { message = e.Message; present = !IsNotReady(e); break; }   // still not ready: let Poll try again
                 }
-                catch (Exception e) { message = e.Message; }
 
                 Post(() =>
                 {
@@ -93,7 +102,9 @@ namespace Discphew.UI
                     Message = message;
                     Loading = false;
                     MediaLoading = present;
+                    mediaSeen = present;
                     Raise();
+                    RefreshLabels();
                 });
 
                 if (!present) return;
@@ -106,6 +117,70 @@ namespace Discphew.UI
                     if (Disc != null) Disc.Media = media;
                     if (Disc != null && Disc.Tracks.Count == 0 && media != null && media.Blank) Message = $"Blank {media.Name}";
                     Raise();
+                });
+            });
+        }
+
+        static (DiscInfo disc, string message, bool present) ReadDrive(char letter)
+        {
+            using var drive = new CdDrive(letter);
+            if (!drive.MediaPresent()) return (null, "No disc in the drive.", false);
+            try
+            {
+                var disc = drive.ReadDisc();
+                if (disc.HasData) disc.FileSystem = FileSystemReader.Read(drive, disc);
+                if (disc.HasAudio) MetadataCache.Load(disc);
+                return (disc, "", true);
+            }
+            catch (DiscException e) when (!e.NotReady)
+            {
+                // Blank or unreadable: IMAPI can still tell us what it is.
+                return (new DiscInfo { Drive = letter }, "No readable tracks (blank disc?)", true);
+            }
+        }
+
+        static bool IsNotReady(Exception e) =>
+            e is DiscException d ? d.NotReady : e is IOException && CdDrive.IsNotReady(e.HResult & 0xFFFF);
+
+        /// <summary>
+        /// While the drive looks empty, keep an eye on it: Windows doesn't always announce a disc
+        /// going in, and when it does the drive is often still spinning up.
+        /// </summary>
+        void Poll()
+        {
+            if (polling || Busy || Loading || Disc != null || Drive == '\0') return;
+            polling = true;
+            char letter = Drive;
+            int gen = generation;
+            Task.Run(() =>
+            {
+                bool present = false;
+                try { using var d = new CdDrive(letter); present = d.MediaPresent(); } catch { }
+                Post(() =>
+                {
+                    polling = false;
+                    if (gen != generation || Busy || Loading || Disc != null) return;
+                    if (present && !mediaSeen) Reload();
+                    else mediaSeen = present;
+                });
+            });
+        }
+
+        /// <summary>Re-reads every drive's volume label in the background.</summary>
+        public void RefreshLabels()
+        {
+            if (labelsPending) return;
+            labelsPending = true;
+            var drives = Drives;
+            Task.Run(() =>
+            {
+                var found = drives.Select(c => (c, label: CdDrive.VolumeLabel(c))).ToList();
+                Post(() =>
+                {
+                    labelsPending = false;
+                    labels.Clear();
+                    foreach (var (c, label) in found) labels[c] = label;
+                    LabelsChanged?.Invoke();
                 });
             });
         }
