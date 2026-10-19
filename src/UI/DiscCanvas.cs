@@ -155,7 +155,7 @@ namespace Discphew.UI
         PointF anchor, worldFrom, worldTo;      // anchor: screen point that tracks the world point during an animation
         Point dragStart;
         PointF lookAtDragStart;
-        bool dragging, suppressClick;
+        bool dragging, suppressClick, fitHot;
 
         public event Action<int> SegmentHovered;
         public event Action<int> SegmentClicked;
@@ -164,6 +164,7 @@ namespace Discphew.UI
         public DiscCanvas()
         {
             SetStyle(ControlStyles.Selectable, true);
+            BackColor = Theme.Bg;       // opaque, so the cached layer can be copied straight in without painting the parent first
             revealTimer.Tick += (s, e) =>
             {
                 double t = (DateTime.Now - revealStart).TotalMilliseconds / 700.0;
@@ -176,7 +177,7 @@ namespace Discphew.UI
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { revealTimer.Dispose(); viewTimer.Dispose(); }
+            if (disposing) { revealTimer.Dispose(); viewTimer.Dispose(); layer?.Dispose(); sheen?.Dispose(); }
             base.Dispose(disposing);
         }
 
@@ -187,6 +188,7 @@ namespace Discphew.UI
             geo = DiscGeometry.For(d);
             segments = segs ?? new List<DiscSegment>();
             usedSectors = used;
+            layerKey = default;         // the same disc can come back with new media info
             hover = -1;
             selected = -1;
             if (animate && d != null)
@@ -370,8 +372,10 @@ namespace Discphew.UI
                     return;
                 }
             }
+            bool tipBefore = hover >= 0 || hoverRegion != null, fitBefore = fitHot;
             UpdateHover();
-            Invalidate();
+            // The tooltip follows the mouse, but over empty space there's nothing to redraw.
+            if (tipBefore || hover >= 0 || hoverRegion != null || fitHot != fitBefore) Invalidate();
             base.OnMouseMove(e);
         }
 
@@ -382,6 +386,7 @@ namespace Discphew.UI
             if (!ClientRectangle.Contains(mouse))
             {
                 if (hover >= 0 || hoverRegion != null) { hover = -1; hoverRegion = null; SegmentHovered?.Invoke(-1); }
+                fitHot = false;
                 return;
             }
             var e = mouse;
@@ -422,7 +427,7 @@ namespace Discphew.UI
                 hoverRegion = region;
                 SegmentHovered?.Invoke(hit);
             }
-            bool onFit = zoom > 1.001 && FitButton.Contains(e);
+            bool onFit = fitHot = zoom > 1.001 && FitButton.Contains(e);
             Cursor = onFit || hit >= 0 ? Cursors.Hand : zoom > 1.001 ? Cursors.SizeAll : Cursors.Default;
         }
 
@@ -493,10 +498,17 @@ namespace Discphew.UI
         /// <summary>Fills the ring between two radii (px), but only the part that can be on screen.</summary>
         void FillRing(Graphics g, Brush b, PointF c, float r0, float r1)
         {
+            using var path = RingPath(c, r0, r1);
+            if (path != null) g.FillPath(b, path);
+        }
+
+        /// <summary>The ring between two radii (px), cut down to the part that can be on screen; null when none of it is.</summary>
+        GraphicsPath RingPath(PointF c, float r0, float r1)
+        {
             r0 = (float)Math.Max(r0, visNear - 4);
             r1 = (float)Math.Min(r1, visFar + 4);
-            if (r1 <= r0) return;
-            using var path = new GraphicsPath(FillMode.Alternate);
+            if (r1 <= r0) return null;
+            var path = new GraphicsPath(FillMode.Alternate);
             if (arcSweep >= 360)
             {
                 path.AddEllipse(c.X - r1, c.Y - r1, r1 * 2, r1 * 2);
@@ -508,7 +520,7 @@ namespace Discphew.UI
                 path.AddArc(c.X - r0, c.Y - r0, r0 * 2, r0 * 2, arcStart + arcSweep, -arcSweep);
                 path.CloseFigure();
             }
-            g.FillPath(b, path);
+            return path;
         }
 
         void FillRing(Graphics g, Color color, PointF c, float r0, float r1)
@@ -524,26 +536,29 @@ namespace Discphew.UI
             else g.DrawArc(pen, c.X - r, c.Y - r, r * 2, r * 2, arcStart, arcSweep);
         }
 
+        // The disc itself is cached: it only changes with the view, the size, the data or the reveal, while hovering
+        // (which repaints on every mouse move) only needs the highlights and the tooltip drawn over it again.
+        Bitmap layer;
+        (double zoom, PointF look, float reveal, DiscInfo disc, List<DiscSegment> segments, long used) layerKey;
+        Bitmap sheen;       // the rainbow sheen at fit-to-view size; a PathGradientBrush over the whole disc costs 25-50 ms a frame
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (disc == null || Width <= 0 || Height <= 0) base.OnPaintBackground(e);    // otherwise the cached layer covers everything
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
-            Theme.Hq(g);
             var c = Center;
             float s = PxPerMm;
-            float R(double mm) => (float)(mm * s);
             ComputeWindow(c);
-
-            // Radii (px) that cross the visible area. Anything outside is skipped: when zoomed in that's nearly everything.
-            double nearest = visNear, farthest = visFar;
-            bool Vis(double mm0, double mm1) => R(mm1) >= nearest - 4 && R(mm0) <= farthest + 4;
-
-            // Soft shadow under the disc.
-            if (Vis(DiscGeometry.OuterMm - 1, DiscGeometry.OuterMm + 2))
-                for (int i = 6; i >= 1; i--)
-                    FillRing(g, Color.FromArgb(10, 0, 0, 0), new PointF(c.X, c.Y + R(1.2)), R(DiscGeometry.OuterMm) - Theme.S(20), R(DiscGeometry.OuterMm) + i * 2.5f);
 
             if (disc == null)
             {
+                Theme.Hq(g);
+                float R(double mm) => (float)(mm * s);
+                DrawShadow(g, c, s);
                 using (var pen = new Pen(Theme.Border, Theme.S(2f)) { DashStyle = DashStyle.Dash })
                 {
                     g.DrawEllipse(pen, c.X - R(60), c.Y - R(60), R(120), R(120));
@@ -553,6 +568,85 @@ namespace Discphew.UI
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 return;
             }
+            if (Width <= 0 || Height <= 0) return;
+
+            var key = (zoom, look, reveal, disc, segments, usedSectors);
+            if (layer == null || layer.Width != Width || layer.Height != Height || !key.Equals(layerKey))
+            {
+                if (layer == null || layer.Width != Width || layer.Height != Height)
+                {
+                    layer?.Dispose();
+                    layer = new Bitmap(Width, Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+                }
+                using var lg = Graphics.FromImage(layer);
+                lg.Clear(BackColor);
+                Theme.Hq(lg);
+                DrawDisc(lg, c, s);
+                layerKey = key;
+            }
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImageUnscaled(layer, 0, 0);
+            g.CompositingMode = CompositingMode.SourceOver;
+            Theme.Hq(g);
+
+            // Highlight: selected and hovered segments.
+            DrawHighlight(g, c, s, selected, Color.FromArgb(70, 255, 255, 255), Theme.Text);
+            if (hover != selected) DrawHighlight(g, c, s, hover, Color.FromArgb(45, 255, 255, 255), Theme.WithAlpha(Theme.Text, 180));
+
+            DrawTrackNumbers(g, c, s);
+            DrawViewOverlay(g, s);
+            DrawTooltip(g);
+        }
+
+        void DrawShadow(Graphics g, PointF c, float s)
+        {
+            float R(double mm) => (float)(mm * s);
+            if (R(DiscGeometry.OuterMm + 2) >= visNear - 4 && R(DiscGeometry.OuterMm - 1) <= visFar + 4)
+                for (int i = 6; i >= 1; i--)
+                    FillRing(g, Color.FromArgb(10, 0, 0, 0), new PointF(c.X, c.Y + R(1.2)), R(DiscGeometry.OuterMm) - Theme.S(20), R(DiscGeometry.OuterMm) + i * 2.5f);
+        }
+
+        /// <summary>Draws the part of the cached sheen (radius <paramref name="r"/> px) that's on screen.</summary>
+        void DrawSheen(Graphics g, PointF c, float r)
+        {
+            // Cached at fit-to-view size, drawn a few pixels past the edge so scaling up never shows the bitmap's own edge.
+            int radius = (int)Math.Ceiling(DiscGeometry.DataEndMm * BaseScale), margin = 3, size = (radius + margin) * 2;
+            if (sheen == null || sheen.Width != size)
+            {
+                sheen?.Dispose();
+                sheen = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+                using var sg = Graphics.FromImage(sheen);
+                Theme.Hq(sg);
+                DiscArt.DrawSheen(sg, new PointF(size / 2f, size / 2f), radius + margin, 34);
+            }
+            float k = radius / r;                       // bitmap pixels per screen pixel
+            float half = size / 2f / k;
+            var whole = new RectangleF(c.X - half, c.Y - half, half * 2, half * 2);
+            var dest = RectangleF.Intersect(whole, ClientRectangle);
+            if (dest.Width <= 0 || dest.Height <= 0) return;
+            var src = new RectangleF((dest.X - whole.X) * k, (dest.Y - whole.Y) * k, dest.Width * k, dest.Height * k);
+            // GDI+'s bilinear upscaling costs ~40 ms a frame; on a gradient this faint nearest-neighbour looks the same,
+            // as long as the edge comes from a vector clip rather than from the bitmap.
+            using var edge = RingPath(c, 0, r);
+            if (edge == null) return;
+            var state = g.Save();
+            g.SetClip(edge, CombineMode.Intersect);
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.DrawImage(sheen, dest, src, GraphicsUnit.Pixel);
+            g.Restore(state);
+        }
+
+        /// <summary>Everything that doesn't depend on the mouse: shadow, body, rings, grooves, sheen and the inner structures.</summary>
+        void DrawDisc(Graphics g, PointF c, float s)
+        {
+            float R(double mm) => (float)(mm * s);
+
+            // Radii (px) that cross the visible area. Anything outside is skipped: when zoomed in that's nearly everything.
+            double nearest = visNear, farthest = visFar;
+            bool Vis(double mm0, double mm1) => R(mm1) >= nearest - 4 && R(mm0) <= farthest + 4;
+
+            // Soft shadow under the disc.
+            DrawShadow(g, c, s);
 
             // Body of the disc.
             var baseColor = BaseColor();
@@ -599,7 +693,7 @@ namespace Discphew.UI
                 for (double mm = geo.ProgramStartMm + 1.5; mm < DiscGeometry.DataEndMm; mm += 1.5)
                     StrokeRing(g, groove, c, R(mm));
             // The sheen reads as a whole-disc effect; zoomed far in it would only add faceting.
-            if (zoom < 30 && Vis(geo.ProgramStartMm, DiscGeometry.DataEndMm)) DiscArt.DrawSheen(g, c, R(DiscGeometry.DataEndMm), 34);
+            if (zoom < 30 && Vis(geo.ProgramStartMm, DiscGeometry.DataEndMm)) DrawSheen(g, c, R(DiscGeometry.DataEndMm));
 
             // Lead-out ring after the recorded area.
             if (usedSectors > 0 && revealMm >= endMm && Vis(endMm, endMm + 1))
@@ -623,14 +717,6 @@ namespace Discphew.UI
             if (Vis(DiscGeometry.OuterMm, DiscGeometry.OuterMm))
                 using (var rim = new Pen(Color.FromArgb(60, 255, 255, 255), 1f))
                     StrokeRing(g, rim, c, R(60));
-
-            // Highlight: selected and hovered segments.
-            DrawHighlight(g, c, s, selected, Color.FromArgb(70, 255, 255, 255), Theme.Text);
-            if (hover != selected) DrawHighlight(g, c, s, hover, Color.FromArgb(45, 255, 255, 255), Theme.WithAlpha(Theme.Text, 180));
-
-            DrawTrackNumbers(g, c, s);
-            DrawViewOverlay(g, s);
-            DrawTooltip(g);
         }
 
         void DrawViewOverlay(Graphics g, float s)

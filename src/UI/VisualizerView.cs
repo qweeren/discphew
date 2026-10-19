@@ -22,6 +22,10 @@ namespace Discphew.UI
         List<(Color color, string name, int count, long bytes)> legend = new List<(Color, string, int, long)>();
         DiscInfo shown;
         bool syncing;
+        // Moving the list's current row scrolls and repaints the grid; sweeping across thousands of files would do
+        // that on every mouse move, so hover follows the list at most every 50 ms (and always lands on the last one).
+        readonly Timer hoverSync = new Timer { Interval = 50 };
+        int hoverPending = -1;
 
         public VisualizerView(AppState state) : base(state)
         {
@@ -70,10 +74,30 @@ namespace Discphew.UI
             side.Controls.Add(summary);
 
             canvas.SegmentClicked += i => SelectRow(i, true);
-            canvas.SegmentHovered += i => { if (i >= 0) SelectRow(i, false); };
+            canvas.SegmentHovered += i =>
+            {
+                if (i < 0) return;
+                if (hoverSync.Enabled) { hoverPending = i; return; }
+                SelectRow(i, false);
+                hoverSync.Start();
+            };
+            hoverSync.Tick += (s, e) =>
+            {
+                hoverSync.Stop();
+                if (hoverPending < 0) return;
+                SelectRow(hoverPending, false);
+                hoverPending = -1;
+                hoverSync.Start();
+            };
 
             Controls.Add(canvas);
             Controls.Add(side);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) hoverSync.Dispose();
+            base.Dispose(disposing);
         }
 
         public override string Title => "Disc Visualizer";
@@ -122,6 +146,7 @@ namespace Discphew.UI
             var d = State.Disc;
             bool fresh = !ReferenceEquals(d, shown);
             shown = d;
+            hoverPending = -1;
             canvas.EmptyText = State.Loading ? "Reading disc…" : State.Disc == null ? (State.Message.Length > 0 ? State.Message : "Insert a disc") : "";
             BuildSegments(d);
             canvas.SetDisc(d, segments, UsedSectors(d), fresh && d != null);
