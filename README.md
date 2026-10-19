@@ -1,4 +1,4 @@
-# discphew
+# discphew (or "disc view")
 
 A lightweight, open-source utility for reading and writing CDs and DVDs, built around an intuitive UI.
 
