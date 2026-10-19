@@ -144,12 +144,26 @@ namespace Discphew.UI
         readonly Timer revealTimer = new Timer { Interval = 15 };
         DateTime revealStart;
 
+        // View: the point on the disc (in mm from the hub) shown at the middle of the control, and a zoom factor.
+        // Keeping the view in disc millimetres means resizing the window never loses your place.
+        public const double MaxZoom = 1000;
+        double zoom = 1;
+        PointF look;
+        readonly Timer viewTimer = new Timer { Interval = 15 };
+        DateTime viewStart;
+        double zoomFrom, zoomTo = 1;
+        PointF anchor, worldFrom, worldTo;      // anchor: screen point that tracks the world point during an animation
+        Point dragStart;
+        PointF lookAtDragStart;
+        bool dragging, suppressClick;
+
         public event Action<int> SegmentHovered;
         public event Action<int> SegmentClicked;
         public string EmptyText = "Insert a disc";
 
         public DiscCanvas()
         {
+            SetStyle(ControlStyles.Selectable, true);
             revealTimer.Tick += (s, e) =>
             {
                 double t = (DateTime.Now - revealStart).TotalMilliseconds / 700.0;
@@ -157,12 +171,18 @@ namespace Discphew.UI
                 if (t >= 1) revealTimer.Stop();
                 Invalidate();
             };
+            viewTimer.Tick += (s, e) => StepView();
         }
 
-        protected override void Dispose(bool disposing) { if (disposing) revealTimer.Dispose(); base.Dispose(disposing); }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { revealTimer.Dispose(); viewTimer.Dispose(); }
+            base.Dispose(disposing);
+        }
 
         public void SetDisc(DiscInfo d, List<DiscSegment> segs, long used, bool animate)
         {
+            if (!ReferenceEquals(d, disc)) { viewTimer.Stop(); zoom = zoomTo = 1; look = PointF.Empty; }
             disc = d;
             geo = DiscGeometry.For(d);
             segments = segs ?? new List<DiscSegment>();
@@ -186,12 +206,185 @@ namespace Discphew.UI
 
         public DiscGeometry Geometry => geo;
 
-        PointF Center => new PointF(Width / 2f, Height / 2f);
-        float PxPerMm => Math.Max(1, Math.Min(Width, Height) * 0.47f / (float)DiscGeometry.OuterMm);
+        PointF ViewCenter => new PointF(Width / 2f, Height / 2f);
+        float BaseScale => Math.Max(1, Math.Min(Width, Height) * 0.47f / (float)DiscGeometry.OuterMm);
+        float PxPerMm => (float)(BaseScale * zoom);
+        /// <summary>Screen position of the hub.</summary>
+        PointF Center => new PointF(ViewCenter.X - look.X * PxPerMm, ViewCenter.Y - look.Y * PxPerMm);
+        PointF ToWorld(PointF screen) => new PointF((screen.X - Center.X) / PxPerMm, (screen.Y - Center.Y) / PxPerMm);
+
+        public double Zoom => zoom;
+
+        /// <summary>Puts <paramref name="world"/> (mm) under <paramref name="screen"/> at the current zoom, keeping the disc in view.</summary>
+        void Place(PointF world, PointF screen)
+        {
+            float s = PxPerMm;
+            var vc = ViewCenter;
+            float x = world.X - (screen.X - vc.X) / s, y = world.Y - (screen.Y - vc.Y) / s;
+            float lim = (float)DiscGeometry.OuterMm;
+            look = new PointF(Math.Max(-lim, Math.Min(lim, x)), Math.Max(-lim, Math.Min(lim, y)));
+        }
+
+        void AnimateTo(double targetZoom, PointF screenAnchor, PointF targetWorld)
+        {
+            targetZoom = Math.Max(1, Math.Min(MaxZoom, targetZoom));
+            // Zooming all the way out always re-centres the disc.
+            if (targetZoom <= 1.0001)
+                targetWorld = new PointF((screenAnchor.X - ViewCenter.X) / BaseScale, (screenAnchor.Y - ViewCenter.Y) / BaseScale);
+            zoomFrom = zoom;
+            zoomTo = targetZoom;
+            anchor = screenAnchor;
+            worldFrom = ToWorld(screenAnchor);
+            worldTo = targetWorld;
+            viewStart = DateTime.Now;
+            viewTimer.Start();
+        }
+
+        void StepView()
+        {
+            double t = Math.Min(1, (DateTime.Now - viewStart).TotalMilliseconds / 220.0);
+            double e = 1 - Math.Pow(1 - t, 3);                       // ease-out
+            zoom = zoomFrom * Math.Pow(zoomTo / zoomFrom, e);       // interpolate in log space so every step feels the same
+            var w = new PointF((float)(worldFrom.X + (worldTo.X - worldFrom.X) * e), (float)(worldFrom.Y + (worldTo.Y - worldFrom.Y) * e));
+            Place(w, anchor);
+            if (t >= 1) viewTimer.Stop();
+            UpdateHover();
+            Invalidate();
+        }
+
+        /// <summary>Zooms by <paramref name="factor"/> around a screen point (the middle when omitted).</summary>
+        public void ZoomBy(double factor, Point? at = null)
+        {
+            if (disc == null) return;
+            var p = at.HasValue ? (PointF)at.Value : ViewCenter;
+            // Chain quick wheel notches onto the running animation's target instead of the current frame.
+            bool chaining = viewTimer.Enabled && anchor == p;
+            double from = viewTimer.Enabled ? zoomTo : zoom;
+            var world = chaining ? worldTo : ToWorld(p);
+            AnimateTo(from * factor, p, world);
+        }
+
+        public void ResetView()
+        {
+            if (zoom == 1 && look == PointF.Empty) return;
+            AnimateTo(1, ViewCenter, PointF.Empty);
+        }
+
+        /// <summary>Flies to a ring so it fills a good part of the view.</summary>
+        public void FocusSegment(int index)
+        {
+            if (disc == null || index < 0 || index >= segments.Count) return;
+            var seg = segments[index];
+            double r0 = geo.Radius(seg.Start), r1 = geo.Radius(seg.End);
+            double band = Math.Max(1e-4, r1 - r0);
+            double target = Math.Min(Width, Height) * 0.22 / (band * BaseScale);
+            target = Math.Max(2.5, Math.Min(MaxZoom, target));
+            selected = index;
+            AnimateTo(target, ViewCenter, new PointF(0, (float)-((r0 + r1) / 2)));
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            ZoomBy(Math.Pow(1.35, e.Delta / 120.0), e.Location);
+            base.OnMouseWheel(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            Focus();
+            if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Middle)
+            {
+                dragStart = e.Location;
+                lookAtDragStart = look;
+                dragging = false;
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (dragging) { dragging = false; suppressClick = true; }
+            else if (e.Button == MouseButtons.Left && zoom > 1.001 && FitButton.Contains(e.Location)) { suppressClick = true; ResetView(); }
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && !(zoom > 1.001 && FitButton.Contains(e.Location)))
+            {
+                if (ModifierKeys.HasFlag(Keys.Shift) || zoom >= MaxZoom * 0.99) ResetView();
+                else ZoomBy(3, e.Location);
+            }
+            base.OnMouseDoubleClick(e);
+        }
+
+        protected override bool IsInputKey(Keys keyData) =>
+            keyData is Keys.Left or Keys.Right or Keys.Up or Keys.Down || base.IsInputKey(keyData);
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            float step = Theme.S(60) / PxPerMm;
+            PointF? to = e.KeyCode switch
+            {
+                Keys.Left => new PointF(look.X - step, look.Y),
+                Keys.Right => new PointF(look.X + step, look.Y),
+                Keys.Up => new PointF(look.X, look.Y - step),
+                Keys.Down => new PointF(look.X, look.Y + step),
+                _ => (PointF?)null,
+            };
+            if (to.HasValue && disc != null)
+            {
+                viewTimer.Stop();
+                Place(to.Value, ViewCenter);
+                UpdateHover();
+                Invalidate();
+                e.Handled = true;
+            }
+            base.OnKeyDown(e);
+        }
+
+        Rectangle FitButton
+        {
+            get
+            {
+                int h = Theme.S(30), w = TextRenderer.MeasureText("Fit disc", Theme.Small).Width + Theme.S(24);
+                return new Rectangle(Width - w - Theme.S(8), Theme.S(8), w, h);
+            }
+        }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             mouse = e.Location;
+            if ((e.Button == MouseButtons.Left || e.Button == MouseButtons.Middle) && disc != null)
+            {
+                int dx = e.X - dragStart.X, dy = e.Y - dragStart.Y;
+                if (!dragging && dx * dx + dy * dy > Theme.S(4) * Theme.S(4)) { dragging = true; viewTimer.Stop(); }
+                if (dragging)
+                {
+                    float s = PxPerMm;
+                    Place(new PointF(lookAtDragStart.X - dx / s, lookAtDragStart.Y - dy / s), ViewCenter);
+                    Cursor = Cursors.SizeAll;
+                    hover = -1; hoverRegion = null;
+                    Invalidate();
+                    base.OnMouseMove(e);
+                    return;
+                }
+            }
+            UpdateHover();
+            Invalidate();
+            base.OnMouseMove(e);
+        }
+
+        void UpdateHover()
+        {
+            if (dragging || !IsHandleCreated) return;
+            mouse = PointToClient(MousePosition);
+            if (!ClientRectangle.Contains(mouse))
+            {
+                if (hover >= 0 || hoverRegion != null) { hover = -1; hoverRegion = null; SegmentHovered?.Invoke(-1); }
+                return;
+            }
+            var e = mouse;
             var c = Center;
             double mm = Math.Sqrt(Math.Pow(e.X - c.X, 2) + Math.Pow(e.Y - c.Y, 2)) / PxPerMm;
             int hit = -1;
@@ -229,9 +422,8 @@ namespace Discphew.UI
                 hoverRegion = region;
                 SegmentHovered?.Invoke(hit);
             }
-            Cursor = hit >= 0 ? Cursors.Hand : Cursors.Default;
-            Invalidate();
-            base.OnMouseMove(e);
+            bool onFit = zoom > 1.001 && FitButton.Contains(e);
+            Cursor = onFit || hit >= 0 ? Cursors.Hand : zoom > 1.001 ? Cursors.SizeAll : Cursors.Default;
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -243,7 +435,8 @@ namespace Discphew.UI
 
         protected override void OnMouseClick(MouseEventArgs e)
         {
-            if (hover >= 0) { selected = hover; SegmentClicked?.Invoke(hover); Invalidate(); }
+            if (suppressClick) { suppressClick = false; base.OnMouseClick(e); return; }
+            if (e.Button == MouseButtons.Left && hover >= 0) { selected = hover; SegmentClicked?.Invoke(hover); Invalidate(); }
             base.OnMouseClick(e);
         }
 
@@ -274,6 +467,63 @@ namespace Discphew.UI
             };
         }
 
+        // Visible window for the current paint: radii (px) that cross the control, and the angular slice they span.
+        double visNear, visFar;
+        float arcStart, arcSweep = 360;
+
+        void ComputeWindow(PointF c)
+        {
+            visNear = Math.Sqrt(Math.Pow(Math.Max(0, Math.Max(-c.X, c.X - Width)), 2) + Math.Pow(Math.Max(0, Math.Max(-c.Y, c.Y - Height)), 2));
+            visFar = Math.Sqrt(Math.Pow(Math.Max(c.X, Width - c.X), 2) + Math.Pow(Math.Max(c.Y, Height - c.Y), 2));
+            arcStart = 0; arcSweep = 360;
+            if (visNear < 8) return;                     // hub on (or next to) the screen: draw whole circles
+            double refAngle = Math.Atan2(Height / 2.0 - c.Y, Width / 2.0 - c.X) * 180 / Math.PI;
+            double lo = 0, hi = 0;
+            foreach (var p in new[] { new PointF(0, 0), new PointF(Width, 0), new PointF(0, Height), new PointF(Width, Height) })
+            {
+                double d = Math.Atan2(p.Y - c.Y, p.X - c.X) * 180 / Math.PI - refAngle;
+                while (d > 180) d -= 360;
+                while (d <= -180) d += 360;
+                lo = Math.Min(lo, d); hi = Math.Max(hi, d);
+            }
+            arcStart = (float)(refAngle + lo - 2);
+            arcSweep = (float)Math.Min(360, hi - lo + 4);
+        }
+
+        /// <summary>Fills the ring between two radii (px), but only the part that can be on screen.</summary>
+        void FillRing(Graphics g, Brush b, PointF c, float r0, float r1)
+        {
+            r0 = (float)Math.Max(r0, visNear - 4);
+            r1 = (float)Math.Min(r1, visFar + 4);
+            if (r1 <= r0) return;
+            using var path = new GraphicsPath(FillMode.Alternate);
+            if (arcSweep >= 360)
+            {
+                path.AddEllipse(c.X - r1, c.Y - r1, r1 * 2, r1 * 2);
+                if (r0 > 0.5f) path.AddEllipse(c.X - r0, c.Y - r0, r0 * 2, r0 * 2);
+            }
+            else
+            {
+                path.AddArc(c.X - r1, c.Y - r1, r1 * 2, r1 * 2, arcStart, arcSweep);
+                path.AddArc(c.X - r0, c.Y - r0, r0 * 2, r0 * 2, arcStart + arcSweep, -arcSweep);
+                path.CloseFigure();
+            }
+            g.FillPath(b, path);
+        }
+
+        void FillRing(Graphics g, Color color, PointF c, float r0, float r1)
+        {
+            using var b = new SolidBrush(color);
+            FillRing(g, b, c, r0, r1);
+        }
+
+        void StrokeRing(Graphics g, Pen pen, PointF c, float r)
+        {
+            if (r <= 0 || r + pen.Width / 2 < visNear - 4 || r - pen.Width / 2 > visFar + 4) return;
+            if (arcSweep >= 360) g.DrawEllipse(pen, c.X - r, c.Y - r, r * 2, r * 2);
+            else g.DrawArc(pen, c.X - r, c.Y - r, r * 2, r * 2, arcStart, arcSweep);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -281,10 +531,16 @@ namespace Discphew.UI
             var c = Center;
             float s = PxPerMm;
             float R(double mm) => (float)(mm * s);
+            ComputeWindow(c);
+
+            // Radii (px) that cross the visible area. Anything outside is skipped: when zoomed in that's nearly everything.
+            double nearest = visNear, farthest = visFar;
+            bool Vis(double mm0, double mm1) => R(mm1) >= nearest - 4 && R(mm0) <= farthest + 4;
 
             // Soft shadow under the disc.
-            for (int i = 6; i >= 1; i--)
-                DiscArt.FillAnnulus(g, Color.FromArgb(10, 0, 0, 0), new PointF(c.X, c.Y + R(1.2)), 0, R(DiscGeometry.OuterMm) + i * 2.5f);
+            if (Vis(DiscGeometry.OuterMm - 1, DiscGeometry.OuterMm + 2))
+                for (int i = 6; i >= 1; i--)
+                    FillRing(g, Color.FromArgb(10, 0, 0, 0), new PointF(c.X, c.Y + R(1.2)), R(DiscGeometry.OuterMm) - Theme.S(20), R(DiscGeometry.OuterMm) + i * 2.5f);
 
             if (disc == null)
             {
@@ -300,69 +556,120 @@ namespace Discphew.UI
 
             // Body of the disc.
             var baseColor = BaseColor();
-            using (var path = DiscArt.Circle(c, R(DiscGeometry.OuterMm)))
             using (var b = new LinearGradientBrush(new RectangleF(c.X - R(60), c.Y - R(60), R(120), R(120)), Theme.Mix(baseColor, Color.White, 0.10), Theme.Mix(baseColor, Color.Black, 0.25), 45f))
-                g.FillPath(b, path);
+                FillRing(g, b, c, 0, R(DiscGeometry.OuterMm));
 
             // Recorded area tint, then each track/file as rings, revealed outward on load.
             double endMm = usedSectors > 0 ? geo.Radius(usedSectors) : geo.ProgramStartMm;
             double revealMm = geo.ProgramStartMm + (DiscGeometry.DataEndMm - geo.ProgramStartMm) * reveal;
             double drawEnd = Math.Min(endMm, revealMm);
-            if (usedSectors > 0)
-                DiscArt.FillAnnulus(g, Theme.Mix(baseColor, Color.Black, 0.18), c, R(geo.ProgramStartMm), R(drawEnd));
+            if (usedSectors > 0 && Vis(geo.ProgramStartMm, drawEnd))
+                FillRing(g, Theme.Mix(baseColor, Color.Black, 0.18), c, R(geo.ProgramStartMm), R(drawEnd));
 
-            int startPx = (int)Math.Floor(R(geo.ProgramStartMm)), endPx = (int)Math.Ceiling(R(drawEnd));
+            int startPx = (int)Math.Max(Math.Floor(R(geo.ProgramStartMm)), Math.Floor(nearest) - 1);
+            int endPx = (int)Math.Min(Math.Ceiling(R(drawEnd)), Math.Ceiling(farthest) + 1);
             int seg = 0;
-            using (var pen = new Pen(Color.White, 1.6f))
+            DiscSegment runSeg = null;
+            int runStart = 0;
+            void FlushRun(int runEnd)
             {
-                for (int px = startPx; px < endPx; px++)
-                {
-                    long a = geo.LbaAt(px / (double)s), b = geo.LbaAt((px + 1) / (double)s);
-                    while (seg < segments.Count && segments[seg].End <= a) seg++;
-                    DiscSegment best = null;
-                    long bestCover = 0;
-                    for (int j = seg; j < segments.Count && segments[j].Start < b; j++)
-                    {
-                        long cover = Math.Min(b, segments[j].End) - Math.Max(a, segments[j].Start);
-                        if (cover > bestCover) { bestCover = cover; best = segments[j]; }
-                    }
-                    if (best == null) continue;
-                    pen.Color = Theme.Mix(best.Color, baseColor, 0.18);
-                    float rr = px + 0.5f;
-                    g.DrawEllipse(pen, c.X - rr, c.Y - rr, rr * 2, rr * 2);
-                }
+                if (runSeg == null) return;
+                // One stroke centred in the band and slightly wider than it, so neighbouring rings never show a seam.
+                float mid = (runStart + runEnd) / 2f;
+                using var pen = new Pen(Theme.Mix(runSeg.Color, baseColor, 0.18), runEnd - runStart + 0.8f);
+                StrokeRing(g, pen, c, mid);
             }
+            for (int px = startPx; px < endPx; px++)
+            {
+                long a = geo.LbaAt(px / (double)s), b = Math.Max(a + 1, geo.LbaAt((px + 1) / (double)s));
+                while (seg < segments.Count && segments[seg].End <= a) seg++;
+                DiscSegment best = null;
+                long bestCover = 0;
+                for (int j = seg; j < segments.Count && segments[j].Start < b; j++)
+                {
+                    long cover = Math.Min(b, segments[j].End) - Math.Max(a, segments[j].Start);
+                    if (cover > bestCover) { bestCover = cover; best = segments[j]; }
+                }
+                if (best != runSeg) { FlushRun(px); runSeg = best; runStart = px; }
+            }
+            FlushRun(endPx);
 
             // Fine grooves and the rainbow sheen you see when light hits the spiral.
             using (var groove = new Pen(Color.FromArgb(16, 0, 0, 0), 1f))
                 for (double mm = geo.ProgramStartMm + 1.5; mm < DiscGeometry.DataEndMm; mm += 1.5)
-                    g.DrawEllipse(groove, c.X - R(mm), c.Y - R(mm), R(mm * 2), R(mm * 2));
-            DiscArt.DrawSheen(g, c, R(DiscGeometry.DataEndMm), 34);
+                    StrokeRing(g, groove, c, R(mm));
+            // The sheen reads as a whole-disc effect; zoomed far in it would only add faceting.
+            if (zoom < 30 && Vis(geo.ProgramStartMm, DiscGeometry.DataEndMm)) DiscArt.DrawSheen(g, c, R(DiscGeometry.DataEndMm), 34);
 
             // Lead-out ring after the recorded area.
-            if (usedSectors > 0 && revealMm >= endMm)
+            if (usedSectors > 0 && revealMm >= endMm && Vis(endMm, endMm + 1))
             {
                 double leadOutEnd = Math.Min(DiscGeometry.DataEndMm, endMm + (geo.Dvd ? 0.6 : 1.0));
-                DiscArt.FillAnnulus(g, Color.FromArgb(150, 12, 13, 16), c, R(endMm), R(leadOutEnd));
+                FillRing(g, Color.FromArgb(150, 12, 13, 16), c, R(endMm), R(leadOutEnd));
             }
 
             // Inner structures: lead-in, mirror band, clamping area, hole.
-            DiscArt.FillAnnulus(g, Color.FromArgb(0x1C, 0x1E, 0x23), c, R(geo.LeadInStartMm), R(geo.ProgramStartMm));
-            using (var path = DiscArt.Annulus(c, R(DiscGeometry.ClampMm), R(DiscGeometry.MirrorMm)))
-            using (var b = new LinearGradientBrush(new RectangleF(c.X - R(23), c.Y - R(23), R(46), R(46)), Color.FromArgb(0x9A, 0xA1, 0xAB), Color.FromArgb(0x50, 0x56, 0x5F), 60f))
-                g.FillPath(b, path);
-            DiscArt.FillAnnulus(g, Color.FromArgb(0x2A, 0x2D, 0x33), c, R(DiscGeometry.HoleMm), R(DiscGeometry.ClampMm));
-            DiscArt.FillAnnulus(g, Color.FromArgb(0x33, 0x37, 0x3E), c, R(10.8), R(11.6));          // stacking ring
-            using (var b = new SolidBrush(Theme.Bg)) g.FillEllipse(b, c.X - R(DiscGeometry.HoleMm), c.Y - R(DiscGeometry.HoleMm), R(DiscGeometry.HoleMm * 2), R(DiscGeometry.HoleMm * 2));
-            using (var rim = new Pen(Color.FromArgb(60, 255, 255, 255), 1f))
-                g.DrawEllipse(rim, c.X - R(60), c.Y - R(60), R(120), R(120));
+            if (Vis(geo.LeadInStartMm, geo.ProgramStartMm))
+                FillRing(g, Color.FromArgb(0x1C, 0x1E, 0x23), c, R(geo.LeadInStartMm), R(geo.ProgramStartMm));
+            if (Vis(DiscGeometry.ClampMm, DiscGeometry.MirrorMm))
+                using (var b = new LinearGradientBrush(new RectangleF(c.X - R(23), c.Y - R(23), R(46), R(46)), Color.FromArgb(0x9A, 0xA1, 0xAB), Color.FromArgb(0x50, 0x56, 0x5F), 60f))
+                    FillRing(g, b, c, R(DiscGeometry.ClampMm), R(DiscGeometry.MirrorMm));
+            if (Vis(0, DiscGeometry.ClampMm))
+            {
+                FillRing(g, Color.FromArgb(0x2A, 0x2D, 0x33), c, R(DiscGeometry.HoleMm), R(DiscGeometry.ClampMm));
+                FillRing(g, Color.FromArgb(0x33, 0x37, 0x3E), c, R(10.8), R(11.6));          // stacking ring
+                FillRing(g, Theme.Bg, c, 0, R(DiscGeometry.HoleMm));
+            }
+            if (Vis(DiscGeometry.OuterMm, DiscGeometry.OuterMm))
+                using (var rim = new Pen(Color.FromArgb(60, 255, 255, 255), 1f))
+                    StrokeRing(g, rim, c, R(60));
 
             // Highlight: selected and hovered segments.
             DrawHighlight(g, c, s, selected, Color.FromArgb(70, 255, 255, 255), Theme.Text);
             if (hover != selected) DrawHighlight(g, c, s, hover, Color.FromArgb(45, 255, 255, 255), Theme.WithAlpha(Theme.Text, 180));
 
             DrawTrackNumbers(g, c, s);
+            DrawViewOverlay(g, s);
             DrawTooltip(g);
+        }
+
+        void DrawViewOverlay(Graphics g, float s)
+        {
+            int pad = Theme.S(10);
+            // Scale bar: the largest "nice" length that fits in ~120 px, so physical size stays readable at any zoom.
+            double[] steps = { 20, 10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001 };
+            double mm = steps.FirstOrDefault(x => x * s <= Theme.S(120));
+            if (mm == 0) mm = steps[steps.Length - 1];
+            float barW = (float)(mm * s);
+            string label = mm >= 1 ? $"{mm:0} mm" : mm >= 0.1 ? $"{mm:0.0} mm" : $"{mm * 1000:0} µm";
+            string zoomText = zoom >= 10 ? $"{zoom:0}×" : $"{zoom:0.0}×";
+            int y = Height - pad - Theme.S(4);
+            using (var pen = new Pen(Theme.Muted, Theme.S(1.5f)))
+            {
+                g.DrawLine(pen, pad, y, pad + barW, y);
+                g.DrawLine(pen, pad, y - Theme.S(5), pad, y);
+                g.DrawLine(pen, pad + barW, y - Theme.S(5), pad + barW, y);
+            }
+            int textH = TextRenderer.MeasureText("0", Theme.Small).Height;
+            string scaleText = $"{label}   ·   {zoomText}";
+            var textRow = new Rectangle(pad, y - Theme.S(8) - textH, TextRenderer.MeasureText(scaleText, Theme.Small).Width + 2, textH);
+            if (zoom > 1.001)
+            {
+                // Zoomed in, the overlay sits on top of coloured rings: give it a backing so it stays legible.
+                var back = Rectangle.FromLTRB(pad - Theme.S(6), textRow.Y - Theme.S(4), Math.Max(textRow.Right, pad + (int)barW) + Theme.S(6), y + Theme.S(6));
+                Theme.FillRound(g, Color.FromArgb(200, 0x16, 0x17, 0x1A), back, Theme.S(6f));
+            }
+            Theme.DrawText(g, scaleText, Theme.Small, Theme.Muted, textRow);
+            if (zoom <= 1.001)
+                Theme.DrawText(g, "Scroll to zoom · drag to pan · double-click to zoom in", Theme.Small, Theme.Faint,
+                    new Rectangle(0, textRow.Y, Width - pad, textH), TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            else
+            {
+                var r = FitButton;
+                bool hot = r.Contains(mouse) && ClientRectangle.Contains(PointToClient(MousePosition));
+                Theme.FillRound(g, hot ? Theme.SurfaceHover : Theme.WithAlpha(Theme.Surface, 230), r, Theme.S(8f));
+                TextRenderer.DrawText(g, "Fit disc", Theme.Small, r, Theme.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            }
         }
 
         void DrawHighlight(Graphics g, PointF c, float s, int index, Color fill, Color line)
@@ -371,10 +678,10 @@ namespace Discphew.UI
             var seg = segments[index];
             float r0 = (float)(geo.Radius(seg.Start) * s), r1 = (float)(geo.Radius(seg.End) * s);
             if (r1 - r0 < 2.5f) { float mid = (r0 + r1) / 2; r0 = mid - 1.25f; r1 = mid + 1.25f; }
-            DiscArt.FillAnnulus(g, fill, c, r0, r1);
+            FillRing(g, fill, c, r0, r1);
             using var pen = new Pen(line, 1.2f);
-            g.DrawEllipse(pen, c.X - r0, c.Y - r0, r0 * 2, r0 * 2);
-            g.DrawEllipse(pen, c.X - r1, c.Y - r1, r1 * 2, r1 * 2);
+            StrokeRing(g, pen, c, r0);
+            StrokeRing(g, pen, c, r1);
         }
 
         void DrawTrackNumbers(Graphics g, PointF c, float s)

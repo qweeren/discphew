@@ -57,6 +57,12 @@ namespace Discphew.UI
                 var row = grid.CurrentRow?.Index ?? -1;
                 canvas.Selected = segments.FindIndex(x => x.Index == row);
             };
+            grid.CellDoubleClick += (s, e) =>
+            {
+                if (listMode.SelectedIndex != 0 || e.RowIndex < 0) return;
+                var seg = RowSegment(e.RowIndex);
+                if (seg != null) canvas.FocusSegment(segments.IndexOf(seg));
+            };
             gridCard.Controls.Add(grid);
 
             side.Controls.Add(gridCard);
@@ -80,6 +86,20 @@ namespace Discphew.UI
                 if (d == null) return State.Loading ? "Reading disc…" : State.Message;
                 return d.DisplayTitle + (d.AlbumArtist.Length > 0 ? " · " + d.AlbumArtist : "") + "  —  the physical layout, from the hub outward";
             }
+        }
+
+        public override bool HandleKey(Keys key)
+        {
+            switch (key)
+            {
+                case Keys.Oemplus: case Keys.Add: case Keys.Shift | Keys.Oemplus: canvas.ZoomBy(1.6); return true;
+                case Keys.OemMinus: case Keys.Subtract: canvas.ZoomBy(1 / 1.6); return true;
+                case Keys.D0: case Keys.NumPad0: case Keys.Home: canvas.ResetView(); return true;
+                case Keys.Enter:
+                    if (canvas.Selected >= 0) { canvas.FocusSegment(canvas.Selected); return true; }
+                    return false;
+            }
+            return false;
         }
 
         void SelectRow(int segIndex, bool select)
