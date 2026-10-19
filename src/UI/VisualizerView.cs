@@ -61,11 +61,17 @@ namespace Discphew.UI
                 var row = grid.CurrentRow?.Index ?? -1;
                 canvas.Selected = segments.FindIndex(x => x.Index == row);
             };
-            grid.CellDoubleClick += (s, e) =>
+            grid.CellClick += (s, e) =>
             {
                 if (listMode.SelectedIndex != 0 || e.RowIndex < 0) return;
                 var seg = RowSegment(e.RowIndex);
                 if (seg != null) canvas.FocusSegment(segments.IndexOf(seg));
+            };
+            grid.CellDoubleClick += (s, e) =>
+            {
+                if (listMode.SelectedIndex != 0 || e.RowIndex < 0) return;
+                var seg = RowSegment(e.RowIndex);
+                if (seg?.FilePath != null && State.Disc != null) OpenFile(State.Disc.Drive + ":\\" + seg.FilePath);
             };
             gridCard.Controls.Add(grid);
 
@@ -230,6 +236,7 @@ namespace Discphew.UI
                     {
                         Start = f.Lba, End = end, Color = colors[f.Extension.Length > 0 ? f.Extension : "(none)"], Index = row++,
                         Title = f.Name,
+                        FilePath = f.Path,
                         Detail = $"{Fmt.Bytes(f.Size)} · sectors {f.Lba:N0}–{end - 1:N0}\n{System.IO.Path.GetDirectoryName(f.Path)}".TrimEnd('\n'),
                     });
                 }
@@ -283,6 +290,22 @@ namespace Discphew.UI
             grid.Columns["size"].HeaderText = layout ? (State.Disc?.HasAudio == true && State.Disc?.HasData != true ? "Length" : "Size") : "Size";
             grid.RowCount = layout ? rows.Length : legend.Count;
             grid.Invalidate();
+        }
+
+        /// <summary>Opens a file from the disc with its default app. Shell calls can stall while the drive spins up, so it runs on its own STA thread.</summary>
+        void OpenFile(string path)
+        {
+            var t = new System.Threading.Thread(() =>
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true }); }
+                catch (Exception ex)
+                {
+                    try { BeginInvoke(new Action(() => Dialogs.Error(Owner, "Couldn't open the file", $"{path}\n\n{ex.Message}"))); }
+                    catch (InvalidOperationException) { }
+                }
+            }) { IsBackground = true };
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
         }
 
         DiscSegment RowSegment(int row) => row >= 0 && row < rows.Length ? rows[row] : null;

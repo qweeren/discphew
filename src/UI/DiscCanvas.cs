@@ -51,6 +51,7 @@ namespace Discphew.UI
         public string Title = "";
         public string Detail = "";
         public int Index = -1;      // row in the side list
+        public string FilePath;     // relative to the drive root, for segments that are files
     }
 
     static class DiscArt
