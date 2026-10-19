@@ -22,10 +22,6 @@ namespace Discphew.UI
         List<(Color color, string name, int count, long bytes)> legend = new List<(Color, string, int, long)>();
         DiscInfo shown;
         bool syncing;
-        // Moving the list's current row scrolls and repaints the grid; sweeping across thousands of files would do
-        // that on every mouse move, so hover follows the list at most every 50 ms (and always lands on the last one).
-        readonly Timer hoverSync = new Timer { Interval = 50 };
-        int hoverPending = -1;
 
         public VisualizerView(AppState state) : base(state)
         {
@@ -79,31 +75,10 @@ namespace Discphew.UI
             side.Controls.Add(modeRow);
             side.Controls.Add(summary);
 
-            canvas.SegmentClicked += i => SelectRow(i, true);
-            canvas.SegmentHovered += i =>
-            {
-                if (i < 0) return;
-                if (hoverSync.Enabled) { hoverPending = i; return; }
-                SelectRow(i, false);
-                hoverSync.Start();
-            };
-            hoverSync.Tick += (s, e) =>
-            {
-                hoverSync.Stop();
-                if (hoverPending < 0) return;
-                SelectRow(hoverPending, false);
-                hoverPending = -1;
-                hoverSync.Start();
-            };
+            canvas.SegmentClicked += SelectRow;
 
             Controls.Add(canvas);
             Controls.Add(side);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) hoverSync.Dispose();
-            base.Dispose(disposing);
         }
 
         public override string Title => "Disc Visualizer";
@@ -132,7 +107,7 @@ namespace Discphew.UI
             return false;
         }
 
-        void SelectRow(int segIndex, bool select)
+        void SelectRow(int segIndex)
         {
             if (listMode.SelectedIndex != 0 || segIndex < 0 || segIndex >= segments.Count) return;
             int row = segments[segIndex].Index;
@@ -141,7 +116,7 @@ namespace Discphew.UI
             try
             {
                 grid.CurrentCell = grid.Rows[row].Cells[1];
-                if (select) canvas.Selected = segIndex;
+                canvas.Selected = segIndex;
             }
             catch { }
             syncing = false;
@@ -152,7 +127,6 @@ namespace Discphew.UI
             var d = State.Disc;
             bool fresh = !ReferenceEquals(d, shown);
             shown = d;
-            hoverPending = -1;
             canvas.EmptyText = State.Loading ? "Reading disc…" : State.Disc == null ? (State.Message.Length > 0 ? State.Message : "Insert a disc") : "";
             BuildSegments(d);
             canvas.SetDisc(d, segments, UsedSectors(d), fresh && d != null);
