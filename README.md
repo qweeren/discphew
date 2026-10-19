@@ -12,7 +12,7 @@ Made for old-heads, retro lovers and collectors who still use discs today, espec
 |---|---|
 | **Disc Visualizer** | The physical layout of the disc: hub, mirror band, lead-in, every track or file drawn as a ring at its real radius on the spiral, lead-out and unrecorded space. Hover any ring for details; data discs are coloured by file type, like WinDirStat. |
 | **Burner** | Data discs (drag in files and folders; ISO 9660 + Joliet + UDF, multisession-aware), audio CDs (FLAC/WAV, or anything ffmpeg reads; hi-res files are resampled and dithered to CD quality), and ISO images. Speed choice, capacity bar, erase for RW discs. |
-| **Ripper** | Audio CDs to FLAC or WAV with no extra software (ALAC, MP3, AAC, Opus and Vorbis if ffmpeg is installed). Two-pass verified reads with cache-defeating re-reads, CRC32 per track, cue sheet and rip log, MusicBrainz metadata, Cover Art Archive artwork and CD-Text. Data discs: exact ISO image or a file copy, optionally converting video (DVD titles → MP4/MOV/MKV) through ffmpeg. |
+| **Ripper** | Audio CDs to FLAC or WAV with no extra software (ALAC, MP3, AAC, Opus and Vorbis if ffmpeg is installed). Two-pass verified reads with cache-defeating re-reads, drive read-offset correction (remembered per drive, or detected with any CD that's in AccurateRip), AccurateRip v1/v2 verification with confidence per track, CRC32 per track, cue sheet and rip log, MusicBrainz metadata, Cover Art Archive artwork and CD-Text. Data discs: exact ISO image or a file copy, optionally converting video (DVD titles → MP4/MOV/MKV) through ffmpeg. |
 | **Album Player** | Plays a CD as an album: straight off the disc, gapless, pregaps and hidden tracks included, with the cover and track list. Also plays a folder of FLAC/WAV files the same way. Space = play/pause, ←/→ = seek, Ctrl+←/→ = previous/next track. |
 
 ## Requirements
@@ -35,6 +35,8 @@ build.cmd -Debug   :: debug build with symbols
 
 `tools\make-icon.ps1` regenerates `assets\discphew.ico`.
 
+`tests\run-tests.ps1` checks the AccurateRip disc IDs, response parsing and v1/v2 checksums against the published vectors from [whipper](https://github.com/whipper-team/whipper) and [arver](https://github.com/arcctgx/arver) (their sample files are downloaded into `bin\testdata` on first run), and the offset correction against a simulated drive.
+
 ## How it's put together
 
 ```
@@ -43,7 +45,8 @@ src/
   Disc/CdDrive.cs          TOC, sessions, CD-Text, raw CD-DA reads, 2048-byte data reads
   Disc/FileSystemReader.cs ISO 9660 / Joliet parser (gives every file's sector position)
   Disc/Imapi.cs            Burning, erasing and media detection via IMAPI2 (late-bound COM)
-  Disc/Ripper.cs           Verified audio ripping, cue/log, ISO imaging, file copy
+  Disc/Ripper.cs           Verified, offset-corrected audio ripping, cue/log, offset detection, ISO imaging, file copy
+  Disc/AccurateRip.cs      AccurateRip disc IDs, database lookup, v1/v2 track checksums
   Disc/Metadata.cs         MusicBrainz disc ID + lookup, Cover Art Archive, local cache
   Audio/FlacEncoder.cs     FLAC encoder (fixed + LPC prediction, partitioned Rice, stereo decorrelation)
   Audio/FlacReader.cs      FLAC decoder with seeking
@@ -59,7 +62,9 @@ The FLAC encoder output decodes bit-identically with libsndfile/libFLAC, and its
 
 ## Known limitations
 
-- Ripping doesn't apply drive read-offset correction or check AccurateRip yet. The rip log says so.
+- Drives can't read into the lead-in or lead-out, so with a non-zero read offset the first or last few samples of the disc are filled with silence (AccurateRip doesn't check those samples). The disc's pressing offset isn't matched either: a rip from a different pressing shows as an AccurateRip mismatch.
+- Offset detection uses AccurateRip v1 checksums, so a key disc that only has v2 entries in the database won't match. A different pressing of the same album can shift the result, so check it with a second disc if you're unsure.
+- Read offsets are stored per drive in `settings.ini`; there's no built-in table of known drive offsets.
 - Audio CDs are burned track-at-once (2-second gaps between tracks, no CD-Text). Disc-at-once with CD-Text would need IMAPI's raw CD writer.
 - File positions in the visualizer need ISO 9660; UDF-only discs show their file list without positions.
 - Only ISO-style (2048-byte sector) images can be burned; BIN/CUE isn't supported yet.

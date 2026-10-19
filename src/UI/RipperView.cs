@@ -43,10 +43,13 @@ namespace Discphew.UI
         readonly CheckField verifyCheck = new CheckField("Verify (read twice)", true);
         readonly CheckField coverCheck = new CheckField("Save cover.jpg", true);
         readonly CheckField logCheck = new CheckField("Cue sheet + log", true);
+        readonly TextField offsetField = new TextField("not set");
+        readonly FlatButton detectButton = new FlatButton("Detect");
         readonly FlatButton ripButton = new FlatButton("Rip tracks", Icons.Rip) { Primary = true };
         readonly ProgressStrip progress = new ProgressStrip { Visible = false };
         readonly Caption status = new Caption("", Theme.Small, Theme.Muted);
-        Panel folderWrap, formatWrap, templateWrap;
+        Panel folderWrap, formatWrap, templateWrap, offsetWrap;
+        string offsetKey;
 
         readonly Panel spacerTop = new Panel { Dock = DockStyle.Top, Height = Theme.S(14), BackColor = Theme.Bg };
         readonly Panel spacerBottom = new Panel { Dock = DockStyle.Bottom, Height = Theme.S(14), BackColor = Theme.Bg };
@@ -143,8 +146,18 @@ namespace Discphew.UI
                 var f = Ui.PickFolder(Owner, "Where should ripped albums go?", folderField.Text);
                 if (f != null) folderField.Text = f;
             };
+            offsetWrap = Ui.Labeled("Read offset (samples)", offsetField, Theme.S(150));
+            offsetField.TextChanged += (s, e) =>
+            {
+                if (filling || offsetKey == null) return;
+                string v = offsetField.Text.Trim();
+                if (v.Length == 0) DriveOffsets.Set(offsetKey, null);
+                else if (int.TryParse(v, out int n)) DriveOffsets.Set(offsetKey, n);
+            };
+            detectButton.Width = detectButton.PreferredWidth;
+            detectButton.Click += (s, e) => DetectOffset();
             ripButton.Click += (s, e) => { if (job != null) job.Cancel(); else RipAudio(); };
-            outputCard.Controls.AddRange(new Control[] { folderWrap, browseButton, formatWrap, templateWrap, verifyCheck, coverCheck, logCheck, ripButton, progress, status });
+            outputCard.Controls.AddRange(new Control[] { folderWrap, browseButton, formatWrap, templateWrap, offsetWrap, detectButton, verifyCheck, coverCheck, logCheck, ripButton, progress, status });
             outputCard.Resize += (s, e) => LayoutOutput();
             outputCard.Height = Theme.S(212);
 
@@ -211,7 +224,10 @@ namespace Discphew.UI
             formatWrap.SetBounds(outputCard.Width - pad - Theme.S(250), pad, Theme.S(250), formatWrap.Height);
             browseButton.SetBounds(formatWrap.Left - gap - browseButton.Width, pad + formatWrap.Height - folderField.Height, browseButton.Width, folderField.Height);
             folderWrap.SetBounds(pad, pad, browseButton.Left - Theme.S(6) - pad, folderWrap.Height);
-            templateWrap.SetBounds(pad, folderWrap.Bottom + Theme.S(10), w, templateWrap.Height);
+            int y2 = folderWrap.Bottom + Theme.S(10);
+            detectButton.SetBounds(outputCard.Width - pad - detectButton.Width, y2 + offsetWrap.Height - offsetField.Height, detectButton.Width, offsetField.Height);
+            offsetWrap.SetBounds(detectButton.Left - Theme.S(6) - offsetWrap.Width, y2, offsetWrap.Width, offsetWrap.Height);
+            templateWrap.SetBounds(pad, y2, Math.Max(Theme.S(100), offsetWrap.Left - gap - pad), templateWrap.Height);
             int y3 = templateWrap.Bottom + Theme.S(14);
             verifyCheck.Location = new Point(pad, y3 + (ripButton.Height - verifyCheck.Height) / 2);
             coverCheck.Location = new Point(verifyCheck.Right + Theme.S(18), verifyCheck.Top);
@@ -265,7 +281,20 @@ namespace Discphew.UI
                 else cover.Image = null;
                 if (d != null && d.HasAudio && d.AlbumTitle.Length == 0 && Settings.GetBool("rip.autolookup", true)) Lookup();
             }
+            ShowOffset();
             UpdateRipButton();
+        }
+
+        /// <summary>Shows the read offset remembered for the current drive once its name is known.</summary>
+        void ShowOffset()
+        {
+            string key = DriveOffsets.Key(State.Disc, State.MediaLoading);
+            if (key == offsetKey) return;
+            offsetKey = key;
+            filling = true;
+            int? v = DriveOffsets.Get(key);
+            offsetField.Text = v.HasValue ? DriveOffsets.Format(v.Value) : "";
+            filling = false;
         }
 
         void FillFields()
@@ -294,6 +323,8 @@ namespace Discphew.UI
             ripButton.Enabled = job != null || (n > 0 && !State.Busy);
             isoButton.Enabled = copyButton.Enabled = job == null && !State.Busy;
             lookupButton.Enabled = job == null;
+            detectButton.Enabled = job == null && !State.Busy && offsetKey != null && shown != null && shown.HasAudio;
+            offsetField.ReadOnly = job != null || offsetKey == null;
             LayoutOutput();
         }
 
@@ -392,6 +423,16 @@ namespace Discphew.UI
             var format = (RipFormat)formatBox.SelectedItem;
             if (format.NeedsFfmpeg && !Ffmpeg.Available) { Dialogs.Error(Owner, "ffmpeg not found", "This format is encoded with ffmpeg. Install it (for example: winget install ffmpeg) or pick FLAC or WAV."); return; }
             if (folderField.Text.Trim().Length == 0) { Dialogs.Error(Owner, "Choose a folder", "Pick where the ripped files should go."); return; }
+            int? readOffset = null;
+            if (offsetField.Text.Trim().Length > 0)
+            {
+                if (!int.TryParse(offsetField.Text.Trim(), out int v) || Math.Abs(v) > 50000)
+                {
+                    Dialogs.Error(Owner, "Check the read offset", "Enter the drive's read offset in samples (for example +6 or -472), leave it empty, or press Detect with a well-known CD in the drive.");
+                    return;
+                }
+                readOffset = v;
+            }
             grid.EndEdit();
             var rows = grid.Rows.Cast<DataGridViewRow>().Where(r => r.Cells[0].Value is bool b && b).ToList();
             var tracks = rows.Select(r => (TrackInfo)r.Tag).ToList();
@@ -408,6 +449,8 @@ namespace Discphew.UI
                 Verify = verifyCheck.Checked,
                 SaveCoverFile = coverCheck.Checked,
                 WriteCueAndLog = logCheck.Checked,
+                AccurateRip = Settings.GetBool("rip.accuraterip", true),
+                ReadOffset = readOffset,
                 Cover = coverBytes,
             };
             var existing = tracks.Select(t => AudioRipper.BuildPath(d, t, o)).Where(File.Exists).ToList();
@@ -456,19 +499,85 @@ namespace Discphew.UI
                 for (int i = 0; i < results.Count; i++)
                 {
                     var r = results[i];
-                    rows[i].Cells["status"].Value = !r.Ok ? r.Error : r.ReadErrors > 0 ? $"⚠ {r.ReadErrors} bad sectors" : r.Unverified > 0 ? $"⚠ {r.Unverified} unverified" : $"✓ {r.Crc:X8}";
+                    rows[i].Cells["status"].Value = TrackStatus(r);
                 }
                 int good = results.Count(r => r.Ok && r.ReadErrors == 0 && r.Unverified == 0);
+                int accurate = results.Count(r => r.Ar == ArState.Match);
+                bool inDatabase = results.Any(r => r.Ar == ArState.Match || r.Ar == ArState.Mismatch);
                 var took = DateTime.Now - started;
-                status.Text = token.IsCancellationRequested ? "Cancelled" : $"Done in {Fmt.Time(took)} · {good} of {tracks.Count} clean";
+                status.Text = token.IsCancellationRequested ? "Cancelled"
+                    : $"Done in {Fmt.Time(took)} · {good} of {tracks.Count} clean" + (inDatabase ? $" · {accurate} accurate" : "");
                 if (!token.IsCancellationRequested && results.Count > 0 && results.Any(r => r.Ok))
                 {
                     string folder = Path.GetDirectoryName(results.First(r => r.Ok).Path);
                     string summary = good == tracks.Count
                         ? $"All {tracks.Count} tracks were read consistently{(o.Verify ? " on both passes" : "")}."
                         : $"{good} of {tracks.Count} tracks are clean. The rest had read problems; check the status column and rip.log.";
+                    if (accurate == tracks.Count)
+                        summary += tracks.Count == 1 ? " AccurateRip confirms it matches other people's rips." : " AccurateRip confirms every track matches other people's rips.";
+                    else if (inDatabase)
+                        summary += $" {accurate} of {tracks.Count} match AccurateRip." + (!o.ReadOffset.HasValue && accurate == 0 ? " Set the drive's read offset (or press Detect) and rip again to check." : "");
+                    else if (results.Any(r => r.Ar == ArState.NotInDatabase))
+                        summary += " This disc isn't in AccurateRip yet.";
                     if (Dialogs.Confirm(Owner, "Rip finished", summary + "\n\n" + folder, "Open folder"))
                         Ui.OpenFolder(folder);
+                }
+            }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
+
+        static string TrackStatus(TrackResult r)
+        {
+            if (!r.Ok) return r.Error;
+            if (r.Ar == ArState.Match) return $"✓ AccurateRip (conf {r.ArConfidence})";
+            if (r.ReadErrors > 0) return $"⚠ {r.ReadErrors} bad sectors";
+            if (r.Unverified > 0) return $"⚠ {r.Unverified} unverified";
+            if (r.Ar == ArState.Mismatch) return "✗ AccurateRip mismatch";
+            return $"✓ {r.Crc:X8}" + (r.Ar == ArState.NotInDatabase ? " · not in AR" : "");
+        }
+
+        void DetectOffset()
+        {
+            var d = shown;
+            string key = offsetKey;
+            if (d == null || !d.HasAudio || key == null || State.Busy || job != null) return;
+            job = new CancellationTokenSource();
+            var token = job.Token;
+            var unlock = State.Lock("Detecting the drive's read offset…", reloadAfter: false);
+            progress.Visible = true;
+            progress.Value = 0;
+            UpdateRipButton();
+            var lastUi = DateTime.MinValue;
+
+            Task.Run(() => AudioRipper.DetectOffset(d, (f, s) =>
+            {
+                if ((DateTime.Now - lastUi).TotalMilliseconds < 120 && f < 1) return;
+                lastUi = DateTime.Now;
+                BeginInvoke(new Action(() => { progress.Value = f; status.Text = $"{s} · {f * 100:0}%"; }));
+            }, () => token.IsCancellationRequested)).ContinueWith(t =>
+            {
+                job = null;
+                progress.Visible = false;
+                unlock.Dispose();
+                UpdateRipButton();
+                if (t.IsFaulted)
+                {
+                    var ex = t.Exception.GetBaseException();
+                    status.Text = ex is OperationCanceledException ? "Cancelled" : "Offset not found";
+                    if (!(ex is OperationCanceledException)) Dialogs.Error(Owner, "Couldn't detect the read offset", ex.Message);
+                    return;
+                }
+                var m = t.Result;
+                string value = DriveOffsets.Format(m.Offset);
+                status.Text = $"Read offset {value}";
+                string how = m.TracksMatched == m.TracksChecked
+                    ? (m.TracksChecked == 1 ? "The track checked matches" : $"All {m.TracksChecked} tracks checked match")
+                    : $"{m.TracksMatched} of {m.TracksChecked} tracks checked match";
+                string text = $"{how} AccurateRip at {value} samples (confidence {m.Confidence}).\n\n"
+                    + "A different pressing of the same album can shift this, so if you're unsure, check it with a second disc.";
+                if (Dialogs.Confirm(Owner, "Read offset found", text, $"Use {value}"))
+                {
+                    if (key == offsetKey) offsetField.Text = value;
+                    else DriveOffsets.Set(key, m.Offset);
                 }
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
