@@ -13,7 +13,16 @@ namespace Discphew.UI
     sealed class BurnerView : ToolView
     {
         sealed class DataItem { public string Path = ""; public bool Folder; public long Bytes = -1; public int Files; }
-        sealed class AudioItem { public string Path = ""; public string Title = "", Artist = ""; public TimeSpan Length; public string Format = ""; public string Error = ""; }
+        sealed class AudioItem
+        {
+            public string Path = "";
+            public string Title = "", Artist = "", Album = "", AlbumArtist = "";
+            public TimeSpan Length;
+            public string Format = "";
+            public string Error = "";
+            public bool Cue;                    // a span of Path that a cue sheet marked out
+            public long Start, End = -1;        // in sectors; End -1 = to the end of the file
+        }
 
         readonly Segmented mode = new Segmented("Data disc", "Audio CD", "Disc image");
         readonly FlatButton eraseButton = new FlatButton("Erase disc", Icons.Refresh) { Subtle = true };
@@ -101,7 +110,7 @@ namespace Discphew.UI
             speedBox.SetItems(new object[] { "max" });
             closeCheck.Checked = Settings.GetBool("burn.close", true);
             ejectCheck.Checked = Settings.GetBool("burn.eject", true);
-            closeCheck.CheckedChanged += (s, e) => Settings.Set("burn.close", closeCheck.Checked);
+            closeCheck.CheckedChanged += (s, e) => { Settings.Set("burn.close", closeCheck.Checked); UpdateCapacity(); };
             ejectCheck.CheckedChanged += (s, e) => Settings.Set("burn.eject", ejectCheck.Checked);
             burnButton.Width = Theme.S(150);
             burnButton.Click += (s, e) => { if (burning) Imapi.Cancel(); else Burn(); };
@@ -211,7 +220,7 @@ namespace Discphew.UI
             }
             grid.CellPainting -= OnCellPainting;
             grid.CellPainting += OnCellPainting;
-            emptyHint.Text = m == 0 ? "Drop files and folders here" : m == 1 ? "Drop FLAC, WAV or other audio files here\n(each file becomes a track)" : "Drop an .iso image here";
+            emptyHint.Text = m == 0 ? "Drop files and folders here" : m == 1 ? "Drop FLAC, WAV or other audio files here\n(each file becomes a track, or add a .cue sheet)" : "Drop an .iso image here";
             LayoutToolbar();
             LayoutBottom();
             LoadSpeeds();
@@ -273,7 +282,8 @@ namespace Discphew.UI
                     }
                     return sectors == 0 ? 0 : sectors + 300 + sectors / 100;           // volume descriptors, path tables, UDF structures
                 case 1:
-                    double secs = audioItems.Sum(a => Math.Ceiling(a.Length.TotalSeconds * 75) / 75.0 + 2);
+                    // A closed disc goes on disc-at-once (one 2-second pregap); left open, every track gets its own.
+                    double secs = audioItems.Sum(a => Math.Ceiling(a.Length.TotalSeconds * 75) / 75.0 + (closeCheck.Checked ? 0 : 2)) + (closeCheck.Checked ? 2 : 0);
                     if (audioItems.Any(a => a.Length == TimeSpan.Zero && a.Error.Length == 0)) unknown = true;
                     return (long)(secs * 75);
                 default:
@@ -307,7 +317,7 @@ namespace Discphew.UI
         void AddFilesDialog()
         {
             using var d = new OpenFileDialog { Multiselect = true, Title = mode.SelectedIndex == 1 ? "Add tracks" : "Add files" };
-            if (mode.SelectedIndex == 1) d.Filter = "Audio|*.flac;*.wav;*.mp3;*.m4a;*.ogg;*.opus;*.aiff;*.aif;*.wv;*.ape|All files|*.*";
+            if (mode.SelectedIndex == 1) d.Filter = "Audio and cue sheets|*.flac;*.wav;*.mp3;*.m4a;*.ogg;*.opus;*.aiff;*.aif;*.wv;*.ape;*.cue|All files|*.*";
             if (d.ShowDialog(Owner) == DialogResult.OK) AddPaths(d.FileNames);
         }
 
@@ -329,7 +339,7 @@ namespace Discphew.UI
                 if (iso != null) { imagePath = iso; Refill(); }
                 else if (paths.Any(p => p.EndsWith(".iso", StringComparison.OrdinalIgnoreCase) || p.EndsWith(".img", StringComparison.OrdinalIgnoreCase)) == false)
                 {
-                    if (paths.Any(AudioFile.IsAudioFile)) { mode.SelectedIndex = 1; AddPaths(paths); }
+                    if (paths.Any(p => AudioFile.IsAudioFile(p) || IsCue(p))) { mode.SelectedIndex = 1; AddPaths(paths); }
                     else { mode.SelectedIndex = 0; AddPaths(paths); }
                 }
                 return;
@@ -361,23 +371,63 @@ namespace Discphew.UI
                 return;
             }
 
-            // Audio: expand folders to their audio files, in name order.
-            var files = new List<string>();
+            // Audio: a cue sheet becomes its tracks, and so does an audio file a cue sheet next to it describes.
+            // Folders use their cue sheets if they have any, else their audio files in name order.
+            var added = new List<AudioItem>();
+            var covered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);     // source files a cue sheet brought in
+            void AddCue(CueSheet cue)
+            {
+                if (cue.Tracks.Count == 0 || cue.Tracks.All(t => covered.Contains(t.File))) return;     // empty, or a second cue for the same rip
+                foreach (var t in cue.Tracks)
+                {
+                    added.Add(new AudioItem
+                    {
+                        Path = t.File, Cue = true, Start = t.Start, End = t.End,
+                        Title = t.Title.Length > 0 ? t.Title : $"Track {t.Number:00}",
+                        Artist = t.Performer, Album = cue.Title, AlbumArtist = cue.Performer,
+                        Error = t.FileFound ? "" : $"{Path.GetFileName(t.File)} not found",
+                    });
+                    covered.Add(t.File);
+                }
+            }
+            CueSheet LoadCue(string path)
+            {
+                try { return CueSheet.Load(path); }
+                catch (Exception e) { status.Text = $"Couldn't read {Path.GetFileName(path)}: {e.Message}"; return null; }
+            }
+            CueSheet CueFor(string file) =>
+                Directory.GetFiles(Path.GetDirectoryName(file), "*.cue").Select(LoadCue)
+                    .FirstOrDefault(c => c != null && c.Tracks.Any(t => string.Equals(t.File, file, StringComparison.OrdinalIgnoreCase)));
+
             foreach (var p in paths)
             {
-                if (Directory.Exists(p)) files.AddRange(Directory.GetFiles(p).Where(AudioFile.IsAudioFile).OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
-                else if (AudioFile.IsAudioFile(p)) files.Add(p);
+                try
+                {
+                    if (Directory.Exists(p))
+                    {
+                        var cues = Directory.GetFiles(p, "*.cue").OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Select(LoadCue).Where(c => c != null && c.Tracks.Count > 0).ToList();
+                        if (cues.Count > 0) cues.ForEach(AddCue);
+                        else added.AddRange(Directory.GetFiles(p).Where(AudioFile.IsAudioFile).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Select(f => new AudioItem { Path = f }));
+                    }
+                    else if (IsCue(p)) { if (LoadCue(p) is CueSheet c) AddCue(c); }
+                    else if (AudioFile.IsAudioFile(p) && !covered.Contains(p))
+                    {
+                        if (CueFor(p) is CueSheet c) AddCue(c);
+                        else added.Add(new AudioItem { Path = p });
+                    }
+                }
+                catch (Exception e) { status.Text = e.Message; }
             }
-            var added = new List<AudioItem>();
-            foreach (var f in files)
+            foreach (var a in added)
             {
-                var a = new AudioItem { Path = f, Title = Path.GetFileNameWithoutExtension(f), Format = Path.GetExtension(f).TrimStart('.').ToUpperInvariant() };
-                if (!Path.GetExtension(f).Equals(".flac", StringComparison.OrdinalIgnoreCase) && !Path.GetExtension(f).StartsWith(".wav", StringComparison.OrdinalIgnoreCase) && !Ffmpeg.Available)
+                string ext = Path.GetExtension(a.Path);
+                if (a.Title.Length == 0) a.Title = Path.GetFileNameWithoutExtension(a.Path);
+                a.Format = ext.TrimStart('.').ToUpperInvariant();
+                if (a.Error.Length == 0 && !ext.Equals(".flac", StringComparison.OrdinalIgnoreCase) && !ext.StartsWith(".wav", StringComparison.OrdinalIgnoreCase) && !Ffmpeg.Available)
                     a.Error = "needs ffmpeg";
                 audioItems.Add(a);
-                added.Add(a);
             }
-            if (files.Count == 0 && paths.Length > 0) status.Text = "No audio files there.";
+            if (added.Count == 0 && paths.Length > 0) status.Text = "No audio files there.";
             Refill();
             Task.Run(() =>
             {
@@ -386,9 +436,23 @@ namespace Discphew.UI
                     try
                     {
                         using var r = AudioFile.Open(a.Path);
-                        a.Length = r.TotalFrames > 0 ? TimeSpan.FromSeconds(r.TotalFrames / (double)r.SampleRate) : Ffmpeg.ProbeDuration(a.Path) ?? TimeSpan.Zero;
+                        var total = r.TotalFrames > 0 ? TimeSpan.FromSeconds(r.TotalFrames / (double)r.SampleRate) : Ffmpeg.ProbeDuration(a.Path) ?? TimeSpan.Zero;
+                        if (a.Cue)
+                        {
+                            // The cue sheet's text wins; the file's tags only fill in what it leaves out.
+                            a.Length = a.End >= 0 ? TimeSpan.FromSeconds((a.End - a.Start) / 75.0) : total - TimeSpan.FromSeconds(a.Start / 75.0);
+                            if (a.Album.Length == 0) a.Album = r.Tag("ALBUM");
+                            if (a.AlbumArtist.Length == 0) a.AlbumArtist = r.Tag("ALBUMARTIST");
+                            a.Format = $"{a.Format} {r.SampleRate / 1000.0:0.#}k/{r.BitsPerSample} · cue";
+                            if (total == TimeSpan.Zero) a.Error = "unknown length";
+                            else if (a.Length <= TimeSpan.Zero || TimeSpan.FromSeconds(a.Start / 75.0) >= total) a.Error = "past the end of the file";
+                            continue;
+                        }
+                        a.Length = total;
                         if (r.Tag("TITLE").Length > 0) a.Title = r.Tag("TITLE");
                         a.Artist = r.Tag("ARTIST");
+                        a.Album = r.Tag("ALBUM");
+                        a.AlbumArtist = r.Tag("ALBUMARTIST");
                         a.Format = $"{a.Format} {r.SampleRate / 1000.0:0.#}k/{r.BitsPerSample}";
                         if (a.Length == TimeSpan.Zero) a.Error = "unknown length";
                     }
@@ -494,7 +558,9 @@ namespace Discphew.UI
             };
 
             var paths = dataItems.Select(x => x.Path).ToList();
-            var tracks = audioItems.Select(x => x.Path).ToList();
+            var tracks = audioItems.Select(x => (x.Path, x.Start, x.End)).ToList();
+            var cdText = m == 1 ? BuildCdText() : null;
+            var burned = AudioBurnMode.TrackAtOnce;
             string label = labelField.Text;
             string image = imagePath;
             string temp = null;
@@ -508,7 +574,7 @@ namespace Discphew.UI
                         temp = Path.Combine(Path.GetTempPath(), "discphew-burn-" + Guid.NewGuid().ToString("N"));
                         Directory.CreateDirectory(temp);
                         var pcm = PreparePcm(tracks, temp, opts.Progress);
-                        Imapi.BurnAudio(opts, pcm);
+                        burned = Imapi.BurnAudio(opts, pcm, cdText);
                         break;
                     default: Imapi.BurnImage(opts, image); break;
                 }
@@ -525,32 +591,73 @@ namespace Discphew.UI
                     return;
                 }
                 status.Text = "Burned successfully";
-                Dialogs.Info(Owner, "Done", m == 1 ? "Your audio CD is ready." : "The disc has been burned.");
+                Dialogs.Info(Owner, "Done", m != 1 ? "The disc has been burned." : burned switch
+                {
+                    AudioBurnMode.DiscAtOnceWithCdText => "Your audio CD is ready: gapless, with CD-Text.",
+                    AudioBurnMode.DiscAtOnce => "Your audio CD is ready: gapless. This drive can't write CD-Text.",
+                    _ => closeCheck.Checked
+                        ? "Your audio CD is ready. This drive or disc couldn't be written disc-at-once, so the tracks have 2-second gaps and no CD-Text."
+                        : "Your audio CD is ready. It was left open, so it was written track-at-once (2-second gaps, no CD-Text).",
+                });
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
-        /// <summary>Decodes each track to raw CD audio (44.1 kHz, 16-bit, stereo), padded to whole sectors.</summary>
-        static List<string> PreparePcm(List<string> files, string folder, Action<BurnProgress> progress)
+        /// <summary>CD-Text from the tracks' tags: the album is the most common ALBUM tag, its performer the album artist or the one shared artist.</summary>
+        byte[] BuildCdText()
+        {
+            static string MostCommon(IEnumerable<string> values) =>
+                values.Where(v => v.Length > 0).GroupBy(v => v).OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault() ?? "";
+            var artists = audioItems.Select(a => a.Artist).Where(a => a.Length > 0).Distinct().ToList();
+            string performer = MostCommon(audioItems.Select(a => a.AlbumArtist));
+            if (performer.Length == 0) performer = artists.Count == 1 ? artists[0] : artists.Count > 1 ? "Various Artists" : "";
+            return CdText.Build(MostCommon(audioItems.Select(a => a.Album)), performer,
+                audioItems.Select(a => a.Title).ToList(), audioItems.Select(a => a.Artist).ToList());
+        }
+
+        static bool IsCue(string path) => path.EndsWith(".cue", StringComparison.OrdinalIgnoreCase) && File.Exists(path);
+
+        /// <summary>
+        /// Decodes each track (a whole file, or the span of one a cue sheet marked out, in sectors) to raw CD audio
+        /// (44.1 kHz, 16-bit, stereo), padded to whole sectors. A cue track that follows on in the same file
+        /// carries on decoding from where the one before stopped.
+        /// </summary>
+        internal static List<string> PreparePcm(List<(string path, long start, long end)> tracks, string folder, Action<BurnProgress> progress)
         {
             var result = new List<string>();
             var buf = new byte[2352 * 32];
-            for (int i = 0; i < files.Count; i++)
+            IAudioReader reader = null;
+            CdPcmStream pcm = null;
+            string open = null;
+            long pos = 0;                                                       // bytes of CD audio taken from the open file
+            try
             {
-                progress?.Invoke(new BurnProgress { Phase = $"Preparing track {i + 1} of {files.Count}", Fraction = i / (double)files.Count });
-                string outPath = Path.Combine(folder, $"{i + 1:00}.pcm");
-                using (var reader = AudioFile.Open(files[i]))
-                using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+                for (int i = 0; i < tracks.Count; i++)
                 {
-                    var pcm = new CdPcmStream(reader);
-                    long total = 0;
+                    progress?.Invoke(new BurnProgress { Phase = $"Preparing track {i + 1} of {tracks.Count}", Fraction = i / (double)tracks.Count });
+                    var (path, start, end) = tracks[i];
+                    long from = start * 2352, to = end < 0 ? long.MaxValue : end * 2352;
+                    if (pcm == null || open != path || pos > from)
+                    {
+                        reader?.Dispose();
+                        reader = AudioFile.Open(path);
+                        open = path;
+                        pos = 0;
+                        if (from > 0 && reader.CanSeek && reader.SampleRate == 44100) { reader.Seek(from / 4); pos = from; }
+                        pcm = new CdPcmStream(reader);
+                    }
                     int n;
-                    while ((n = pcm.Read(buf, 0, buf.Length)) > 0) { fs.Write(buf, 0, n); total += n; }
+                    while (pos < from && (n = pcm.Read(buf, 0, (int)Math.Min(buf.Length, from - pos))) > 0) pos += n;
+
+                    using var fs = new FileStream(Path.Combine(folder, $"{i + 1:00}.pcm"), FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+                    long total = 0;
+                    while (pos < to && (n = pcm.Read(buf, 0, (int)Math.Min(buf.Length, to - pos))) > 0) { fs.Write(buf, 0, n); total += n; pos += n; }
                     long pad = (2352 - total % 2352) % 2352;
                     if (total < 2352 * 75 * 4) pad += 2352 * 75 * 4 - total;      // tracks must be at least 4 seconds
                     if (pad > 0) fs.Write(new byte[pad], 0, (int)pad);
+                    result.Add(fs.Name);
                 }
-                result.Add(outPath);
             }
+            finally { reader?.Dispose(); }
             return result;
         }
 

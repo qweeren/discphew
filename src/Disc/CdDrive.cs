@@ -318,5 +318,127 @@ namespace Discphew.Disc
             }
             return result;
         }
+
+        /// <summary>
+        /// Builds block 0 (ISO-8859-1, English) as 18-byte packs: titles, performers when there are any,
+        /// and the three size-information packs that close the block. Index 0 of each list is the album.
+        /// </summary>
+        public static byte[] Build(string albumTitle, string albumPerformer, IList<string> titles, IList<string> performers)
+        {
+            bool anyPerformer = !string.IsNullOrWhiteSpace(albumPerformer) || performers.Any(p => !string.IsNullOrWhiteSpace(p));
+            // A block holds at most 256 packs, so very long texts get shortened until everything fits.
+            for (int max = 160; ; max = max * 2 / 3)
+            {
+                var packs = new List<byte[]>();
+                var counts = new int[16];
+                AddText(packs, counts, 0x80, new[] { albumTitle }.Concat(titles), max);
+                if (anyPerformer) AddText(packs, counts, 0x81, new[] { albumPerformer }.Concat(performers), max);
+                if (packs.Count + 3 > 256 && max > 8) continue;
+
+                counts[0x0F] = 3;
+                var info = new byte[36];
+                info[1] = 1;                                // first track
+                info[2] = (byte)titles.Count;               // last track
+                for (int i = 0; i < 16; i++) info[4 + i] = (byte)counts[i];
+                info[20] = (byte)(packs.Count + 3 - 1);     // last sequence number in block 0
+                info[28] = 0x09;                            // English
+                for (int i = 0; i < 3; i++)
+                {
+                    var p = new byte[18];
+                    p[0] = 0x8F;
+                    p[1] = (byte)i;
+                    Array.Copy(info, i * 12, p, 4, 12);
+                    packs.Add(p);
+                }
+
+                var result = new byte[packs.Count * 18];
+                for (int i = 0; i < packs.Count; i++)
+                {
+                    var p = packs[i];
+                    p[2] = (byte)i;
+                    int crc = ~Crc16(p, 0, 16);
+                    p[16] = (byte)(crc >> 8);
+                    p[17] = (byte)crc;
+                    Array.Copy(p, 0, result, i * 18, 18);
+                }
+                return result;
+            }
+        }
+
+        static void AddText(List<byte[]> packs, int[] counts, int type, IEnumerable<string> texts, int max)
+        {
+            var bytes = new List<byte>();
+            var owner = new List<(int track, int pos)>();
+            int track = 0;
+            foreach (var t in texts)
+            {
+                var b = Latin1(t);
+                int n = Math.Min(b.Length, max);
+                for (int i = 0; i <= n; i++) { bytes.Add(i < n ? b[i] : (byte)0); owner.Add((track, i)); }
+                track++;
+            }
+            for (int o = 0; o < bytes.Count; o += 12)
+            {
+                var p = new byte[18];
+                p[0] = (byte)type;
+                p[1] = (byte)owner[o].track;                    // the string this pack's first character belongs to
+                p[3] = (byte)Math.Min(15, owner[o].pos);        // characters of that string in earlier packs
+                for (int j = 0; j < 12 && o + j < bytes.Count; j++) p[4 + j] = bytes[o + j];
+                packs.Add(p);
+                counts[type & 0x0F]++;
+            }
+        }
+
+        /// <summary>Folds text into ISO-8859-1: typographic punctuation to ASCII, other letters to their base letter.</summary>
+        static byte[] Latin1(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (char c in (s ?? "").Trim().Normalize(NormalizationForm.FormC))
+            {
+                if (c < 0x20 || (c >= 0x7F && c < 0xA0) || char.IsLowSurrogate(c)) continue;   // a lone tab would mean "same as before"
+                if (c <= 0xFF) { sb.Append(c); continue; }
+                switch (c)
+                {
+                    case '‘': case '’': case '′': sb.Append('\''); break;
+                    case '“': case '”': case '″': sb.Append('"'); break;
+                    case '‐': case '–': case '—': sb.Append('-'); break;
+                    case '…': sb.Append("..."); break;
+                    default:
+                        char b = c.ToString().Normalize(NormalizationForm.FormD)[0];
+                        sb.Append(b <= 0xFF ? b : '?');
+                        break;
+                }
+            }
+            return Encoding.GetEncoding(28591).GetBytes(sb.ToString());
+        }
+
+        /// <summary>CRC-16/CCITT (x¹⁶ + x¹² + x⁵ + 1, initial 0); CD-Text stores it inverted.</summary>
+        public static int Crc16(byte[] b, int offset, int count)
+        {
+            int crc = 0;
+            for (int i = 0; i < count; i++)
+            {
+                crc ^= b[offset + i] << 8;
+                for (int k = 0; k < 8; k++) crc = ((crc & 0x8000) != 0 ? (crc << 1) ^ 0x1021 : crc << 1) & 0xFFFF;
+            }
+            return crc;
+        }
+
+        /// <summary>
+        /// The packs as R-W subcode symbols, 6 bits per byte with P and Q left clear: 24 per pack,
+        /// so each 96-byte sector of lead-in subcode carries four whole packs.
+        /// </summary>
+        public static byte[] ToSubcode(byte[] packs)
+        {
+            var s = new byte[packs.Length / 3 * 4];
+            for (int i = 0, o = 0; i + 2 < packs.Length; i += 3, o += 4)
+            {
+                s[o] = (byte)(packs[i] >> 2);
+                s[o + 1] = (byte)(((packs[i] & 0x03) << 4) | (packs[i + 1] >> 4));
+                s[o + 2] = (byte)(((packs[i + 1] & 0x0F) << 2) | (packs[i + 2] >> 6));
+                s[o + 3] = (byte)(packs[i + 2] & 0x3F);
+            }
+            return s;
+        }
     }
 }

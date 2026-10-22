@@ -11,7 +11,7 @@ namespace Discphew.Tests
     /// Checks the AccurateRip and offset-correction code against published test vectors.
     /// Run with tests\run-tests.ps1, which also fetches the sample files the checksum vectors refer to.
     /// </summary>
-    static class TestProgram
+    static partial class TestProgram
     {
         static int failed, passed;
         static string dataDir = "";
@@ -24,6 +24,10 @@ namespace Discphew.Tests
             Run("AccurateRip v1/v2 checksums (arver sample.wav)", ChecksumVectors);
             Run("v1 at every offset equals direct checksums", SlidingChecksums);
             Run("read offset correction", OffsetCorrection);
+            Run("CD-Text packs", CdTextPacks);
+            Run("CD-Text in a raw disc-at-once image (IMAPI)", CdTextRawImage);
+            Run("cue sheet parsing", CueParsing);
+            Run("cue tracks split out of one file", CueSplitting);
             Console.WriteLine();
             Console.WriteLine(failed == 0 ? $"All {passed} checks passed." : $"{failed} of {passed + failed} checks FAILED.");
             return failed == 0 ? 0 : 1;

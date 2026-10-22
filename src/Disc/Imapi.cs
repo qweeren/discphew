@@ -61,12 +61,19 @@ namespace Discphew.Disc
         [DispId(0x200)] void Update([In, MarshalAs(UnmanagedType.IDispatch)] object sender, int elapsedSeconds, int estimatedTotalSeconds);
     }
 
+    [ComImport, Guid("27354142-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    public interface DDiscFormat2RawCDEvents
+    {
+        [DispId(0x200)] void Update([In, MarshalAs(UnmanagedType.IDispatch)] object sender, [In, MarshalAs(UnmanagedType.IDispatch)] object progress);
+    }
+
     [ClassInterface(ClassInterfaceType.None), ComVisible(true)]
-    public sealed class WriteEventSink : DDiscFormat2DataEvents, DDiscFormat2TrackAtOnceEvents
+    public sealed class WriteEventSink : DDiscFormat2DataEvents, DDiscFormat2TrackAtOnceEvents, DDiscFormat2RawCDEvents
     {
         public Action<object> OnUpdate;
         void DDiscFormat2DataEvents.Update(object sender, object progress) => OnUpdate?.Invoke(progress);
         void DDiscFormat2TrackAtOnceEvents.Update(object sender, object progress) => OnUpdate?.Invoke(progress);
+        void DDiscFormat2RawCDEvents.Update(object sender, object progress) => OnUpdate?.Invoke(progress);
     }
 
     [ClassInterface(ClassInterfaceType.None), ComVisible(true)]
@@ -95,6 +102,8 @@ namespace Discphew.Disc
         public Action<BurnProgress> Progress;
     }
 
+    public enum AudioBurnMode { TrackAtOnce, DiscAtOnce, DiscAtOnceWithCdText }
+
     public sealed class WriteSpeed
     {
         public int SectorsPerSecond;
@@ -111,6 +120,7 @@ namespace Discphew.Disc
         const string ClientName = "discphew";
         static readonly Guid DataEventsIid = typeof(DDiscFormat2DataEvents).GUID;
         static readonly Guid TaoEventsIid = typeof(DDiscFormat2TrackAtOnceEvents).GUID;
+        static readonly Guid RawEventsIid = typeof(DDiscFormat2RawCDEvents).GUID;
         static readonly Guid EraseEventsIid = typeof(DDiscFormat2EraseEvents).GUID;
 
         static object activeWriter;
@@ -270,6 +280,24 @@ namespace Discphew.Disc
             o.Progress(p);
         }
 
+        /// <summary>Raw disc-at-once progress. <paramref name="starts"/> holds each track's first LBA, then the lead-out's.</summary>
+        static void ReportRaw(BurnOptions o, object args, long[] starts)
+        {
+            if (o.Progress == null) return;
+            int action = Com.GetOr(args, "CurrentAction", -1);
+            long start = Com.GetOr(args, "StartLba", 0L), count = Com.GetOr(args, "SectorCount", 0L), last = Com.GetOr(args, "LastWrittenLba", 0L);
+            int tracks = starts.Length - 1, track = starts.Take(tracks).Count(s => s <= last);
+            string writing = last < 0 ? "Writing the lead-in" : last >= starts[tracks] ? "Writing the lead-out" : $"Writing track {track} of {tracks}";
+            o.Progress(new BurnProgress
+            {
+                // Raw CD: 0 unknown, 1 preparing, 2 writing, 3 finishing
+                Phase = action switch { 1 => "Preparing", 2 => writing, 3 => "Finishing", _ => "Working" },
+                Fraction = action == 2 && count > 0 ? Math.Max(0, Math.Min(1, (last - start) / (double)count)) : -1,
+                ElapsedSeconds = Com.GetOr(args, "ElapsedTime", 0),
+                RemainingSeconds = Com.GetOr(args, "RemainingTime", -1),
+            });
+        }
+
         static void Finish(BurnOptions o, object rec)
         {
             o.Progress?.Invoke(new BurnProgress { Phase = "Done", Fraction = 1 });
@@ -374,10 +402,131 @@ namespace Discphew.Disc
         }
 
         /// <summary>
-        /// Burns an audio CD track-at-once. Each file must be raw 44.1 kHz / 16-bit / stereo
-        /// little-endian PCM whose length is a multiple of 2352 bytes.
+        /// Burns an audio CD. Each file must be raw 44.1 kHz / 16-bit / stereo little-endian PCM whose
+        /// length is a multiple of 2352 bytes. A blank disc that's being closed goes on disc-at-once
+        /// (gapless, with <paramref name="cdText"/> packs in the lead-in if the drive takes raw subcode);
+        /// otherwise, or if the drive can't write raw, the tracks are written track-at-once.
         /// </summary>
-        public static void BurnAudio(BurnOptions o, IList<string> pcmFiles)
+        public static AudioBurnMode BurnAudio(BurnOptions o, IList<string> pcmFiles, byte[] cdText = null)
+        {
+            if (o.CloseDisc && TryBurnAudioRaw(o, pcmFiles, cdText) is AudioBurnMode mode) return mode;
+            BurnAudioTrackAtOnce(o, pcmFiles);
+            return AudioBurnMode.TrackAtOnce;
+        }
+
+        internal const int SubcodePqOnly = 1, SubcodeRaw = 3;
+        internal const int RawImageStartLba = -22650;        // raw images start at MSF 95:00:00, inside any disc's lead-in
+        const int FirstPregap = 150;
+
+        /// <summary>Disc-at-once through IMAPI's raw (DAO-96) writer. Returns null, having written nothing, when the drive or disc can't do it.</summary>
+        static AudioBurnMode? TryBurnAudioRaw(BurnOptions o, IList<string> pcmFiles, byte[] cdText)
+        {
+            if (Type.GetTypeFromProgID("IMAPI2.MsftDiscFormat2RawCD", false) == null) return null;
+            var rec = RequireRecorder(o.Drive);
+            var raw = Com.Create("IMAPI2.MsftDiscFormat2RawCD");
+            var streams = new List<IStream>();
+            object creator = null, image = null;
+            IStream subcode = null;
+            IConnectionPoint cp = null; int cookie = 0;
+            bool prepared = false;
+            try
+            {
+                if (!(bool)Com.Call(raw, "IsRecorderSupported", rec)) return null;
+                Com.Set(raw, "Recorder", rec);
+                Com.Set(raw, "ClientName", ClientName);
+                if (!(bool)Com.Call(raw, "IsCurrentMediaSupported", rec) || !Com.GetOr(raw, "MediaHeuristicallyBlank", false)) return null;
+                var types = Com.Get(raw, "SupportedSectorTypes") is object[] t ? t.Select(x => Convert.ToInt32(x)).ToList() : new List<int>();
+                // CD-Text needs raw R-W subcode: in the lead-in its packs are written as they are, not interleaved.
+                bool withText = cdText != null && cdText.Length > 0 && types.Contains(SubcodeRaw);
+                int type = withText ? SubcodeRaw : types.Contains(SubcodePqOnly) ? SubcodePqOnly : types.FirstOrDefault();
+                if (type == 0) return null;
+
+                var starts = new long[pcmFiles.Count + 1];
+                for (int i = 0; i < pcmFiles.Count; i++) starts[i + 1] = starts[i] + new FileInfo(pcmFiles[i]).Length / 2352;
+                long limit = Com.GetOr(raw, "LastPossibleStartOfLeadout", 0L);
+                if (limit > 0 && starts[pcmFiles.Count] > limit) throw new DiscException($"Those tracks need {Fmt.Time(TimeSpan.FromSeconds(starts[pcmFiles.Count] / 75.0))} but the disc only has {Fmt.Time(TimeSpan.FromSeconds(limit / 75.0))}.");
+
+                o.Progress?.Invoke(new BurnProgress { Phase = "Laying out the disc" });
+                if (withText) subcode = CdTextSubcode(pcmFiles, cdText, streams);
+                creator = CreateRawImage(type, pcmFiles, subcode, streams, out image);
+                SetSpeed(raw, o.Speed);
+
+                var sink = new WriteEventSink { OnUpdate = a => ReportRaw(o, a, starts) };
+                cookie = Advise(raw, RawEventsIid, sink, out cp);
+                activeWriter = raw; activeCancelMethod = "CancelWrite";
+
+                o.Progress?.Invoke(new BurnProgress { Phase = "Preparing the disc" });
+                Com.Call(raw, "PrepareMedia");
+                prepared = true;
+                Com.Set(raw, "RequestedSectorType", type);
+                Com.Call(raw, "WriteMedia", image);
+                o.Progress?.Invoke(new BurnProgress { Phase = "Closing the disc" });
+                Com.Call(raw, "ReleaseMedia");
+                prepared = false;
+                Finish(o, rec);
+                return withText ? AudioBurnMode.DiscAtOnceWithCdText : AudioBurnMode.DiscAtOnce;
+            }
+            catch (COMException e) { throw Translate(e); }
+            finally
+            {
+                activeWriter = null;
+                if (prepared) try { Com.Call(raw, "ReleaseMedia"); } catch { }
+                if (cp != null) try { cp.Unadvise(cookie); } catch { }
+                Com.Release(image); Com.Release(creator); Com.Release(subcode);
+                foreach (var s in streams) Com.Release(s);
+                Com.Release(raw); Com.Release(rec);
+            }
+        }
+
+        /// <summary>
+        /// R-W subcode carrying the CD-Text packs, written next to the first track as cdtext.sub.
+        /// The stream has to cover the raw image sector for sector, so the image is laid out once to measure it.
+        /// </summary>
+        internal static IStream CdTextSubcode(IList<string> pcmFiles, byte[] cdText, List<IStream> streams)
+        {
+            var probe = CreateRawImage(SubcodeRaw, pcmFiles, null, streams, out var probeImage);
+            ((IStream)probeImage).Stat(out var stat, 1);
+            Com.Release(probeImage); Com.Release(probe);
+            string path = Path.Combine(Path.GetDirectoryName(pcmFiles[0]), "cdtext.sub");
+            // CD-Text repeats through the lead-in and stops a second short of track 1's pregap, which
+            // keeps the program area's R-W clear (IMAPI reads the stream a couple of sectors ahead).
+            WriteLeadInSubcode(path, CdText.ToSubcode(cdText), stat.cbSize / 2448, -RawImageStartLba - FirstPregap - 75);
+            return OpenStream(path);
+        }
+
+        /// <summary>Lays the tracks out gapless (track 1 gets the standard 2-second pregap) as a raw image starting at MSF 95:00:00.</summary>
+        internal static object CreateRawImage(int type, IList<string> pcmFiles, IStream subcode, List<IStream> streams, out object image)
+        {
+            var creator = Com.Create("IMAPI2.MsftRawCDImageCreator");
+            Com.Set(creator, "ResultingImageType", type);
+            foreach (var f in pcmFiles)
+            {
+                var s = OpenStream(f);
+                streams.Add(s);
+                Com.Call(creator, "AddTrack", 0, s);       // IMAPI_CD_SECTOR_AUDIO
+            }
+            if (subcode != null) Com.Call(creator, "AddSubcodeRWGenerator", subcode);
+            image = Com.Call(creator, "CreateResultImage");
+            return creator;
+        }
+
+        /// <summary>Writes 96 bytes of R-W subcode per image sector: the CD-Text cycle for the first <paramref name="textSectors"/>, silence after.</summary>
+        static void WriteLeadInSubcode(string path, byte[] symbols, long sectors, long textSectors)
+        {
+            var sector = new byte[96];
+            int at = 0;
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
+            for (long s = 0; s < sectors; s++)
+            {
+                if (s < textSectors)
+                    for (int i = 0; i < 96; i++) { sector[i] = symbols[at++]; if (at == symbols.Length) at = 0; }
+                else if (s == textSectors)
+                    Array.Clear(sector, 0, 96);
+                fs.Write(sector, 0, 96);
+            }
+        }
+
+        static void BurnAudioTrackAtOnce(BurnOptions o, IList<string> pcmFiles)
         {
             var rec = RequireRecorder(o.Drive);
             var tao = Com.Create("IMAPI2.MsftDiscFormat2TrackAtOnce");
