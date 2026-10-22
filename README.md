@@ -1,4 +1,4 @@
-# discphew
+# discphew (or "disc view")
 
 A lightweight, open-source utility for reading and writing CDs and DVDs, built around an intuitive UI.
 
@@ -6,7 +6,7 @@ Most disc software is either bloated (multi-GB suites that install a separate pr
 
 Made for old-heads, retro lovers and collectors who still use discs today, especially people keeping lossless album collections on CD.
 
-![discphew screenshot](https://cdn.discordapp.com/attachments/1119728697986003004/1561786836530233474/image.png?ex=6ad79ed6&is=6ad64d56&hm=8bf38bfacfdd70e9ac18ed4347efe1a24a4e37b329d234a16e25d8f23ad823f4&)
+![discphew screenshot](https://qweren.com/discphew.png)
 
 ## Tools
 
