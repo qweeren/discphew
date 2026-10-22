@@ -201,6 +201,18 @@ namespace Discphew.UI
 
         public static void Stop(Graphics g, RectangleF r, Color c) => Theme.FillRound(g, c, Inset(r, 0.24f), r.Width * 0.08f);
 
+        public static void Shuffle(Graphics g, RectangleF r, Color c)
+        {
+            using var pen = P(c, r, 0.08f);
+            float x = r.X, y = r.Y, w = r.Width, h = r.Height;
+            PointF Pt(float fx, float fy) => new PointF(x + w * fx, y + h * fy);
+            // Two paths that cross in the middle, each ending in an arrowhead on the right.
+            g.DrawBezier(pen, Pt(0.1f, 0.28f), Pt(0.5f, 0.28f), Pt(0.5f, 0.72f), Pt(0.84f, 0.72f));
+            g.DrawBezier(pen, Pt(0.1f, 0.72f), Pt(0.5f, 0.72f), Pt(0.5f, 0.28f), Pt(0.84f, 0.28f));
+            g.DrawLines(pen, new[] { Pt(0.72f, 0.16f), Pt(0.88f, 0.28f), Pt(0.72f, 0.4f) });
+            g.DrawLines(pen, new[] { Pt(0.72f, 0.6f), Pt(0.88f, 0.72f), Pt(0.72f, 0.84f) });
+        }
+
         public static void Eject(Graphics g, RectangleF r, Color c)
         {
             float x = r.X, y = r.Y, w = r.Width, h = r.Height;

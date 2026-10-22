@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
 using System.Threading.Tasks;
@@ -28,6 +29,7 @@ namespace Discphew.UI
         readonly FlatButton playButton = new FlatButton("", Icons.Play) { Primary = true, IconSize = 20 };
         readonly FlatButton nextButton = new FlatButton("", Icons.Next) { Subtle = true, IconSize = 18 };
         readonly FlatButton stopButton = new FlatButton("", Icons.Stop) { Subtle = true, IconSize = 16 };
+        readonly FlatButton shuffleButton = new FlatButton("", Icons.Shuffle) { Subtle = true, IconSize = 18 };
         readonly Slider seek = new Slider();
         readonly Caption timeLeft = new Caption("0:00", Theme.Small, Theme.Muted);
         readonly Caption timeRight = new Caption("0:00", Theme.Small, Theme.Muted);
@@ -41,6 +43,22 @@ namespace Discphew.UI
         int currentTrack = -1;
         double gain = 1;
         bool playing;
+
+        // Shuffle: the order tracks play in (built when playback starts), and how far Fill has got through it.
+        bool shuffle;
+        List<int> order;
+        int orderPos;
+        readonly Random rng = new Random();
+
+        // Shuffle jumps around the source inside Fill, so what the player has played is no longer one continuous
+        // stretch of the album. Each entry is where a stretch starts: frames handed to the player since the last
+        // flush, and the source frame it came from. Guarded by sourceLock.
+        readonly List<(long output, long source)> jumps = new List<(long, long)> { (0, 0) };
+        long produced;
+        byte[] scratch = new byte[0];
+
+        // Covers found on MusicBrainz for albums that came without one, by artist + album (null: none found).
+        readonly Dictionary<string, byte[]> foundCovers = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
 
         public PlayerView(AppState state) : base(state)
         {
@@ -72,6 +90,9 @@ namespace Discphew.UI
             nextButton.Click += (s, e) => Next();
             playButton.Click += (s, e) => TogglePlay();
             stopButton.Click += (s, e) => Stop();
+            shuffleButton.Size = stopButton.Size;
+            shuffleButton.Click += (s, e) => SetShuffle(!shuffle);
+            SetShuffle(Settings.GetBool("player.shuffle", false), remember: false);
             seek.Scrubbed += v => timeLeft.Text = Fmt.Time(TimeSpan.FromSeconds(v * (source?.TotalFrames ?? 0) / (double)(source?.SampleRate ?? 44100)));
             seek.Committed += v => { if (source != null) SeekTo((long)(v * source.TotalFrames)); };
             volume.Value = Settings.GetInt("player.volume", 85) / 100.0;
@@ -79,7 +100,7 @@ namespace Discphew.UI
             volume.Scrubbed += v => { gain = v * v; };
             volume.Committed += v => { gain = v * v; Settings.Set("player.volume", (int)(v * 100)); };
             volumeIcon.Paint += (s, e) => { Theme.Hq(e.Graphics); Icons.Volume(e.Graphics, new RectangleF(0, 0, volumeIcon.Width, volumeIcon.Height), Theme.Muted); };
-            transport.Controls.AddRange(new Control[] { nowTitle, nowArtist, prevButton, playButton, nextButton, stopButton, seek, timeLeft, timeRight, volumeIcon, volume });
+            transport.Controls.AddRange(new Control[] { nowTitle, nowArtist, shuffleButton, prevButton, playButton, nextButton, stopButton, seek, timeLeft, timeRight, volumeIcon, volume });
             transport.Resize += (s, e) => LayoutTransport();
             timeRight.TextAlign = ContentAlignment.MiddleRight;
 
@@ -123,6 +144,7 @@ namespace Discphew.UI
             prevButton.Location = new Point(playButton.Left - Theme.S(10) - prevButton.Width, controlsY + (playButton.Height - prevButton.Height) / 2 - Theme.S(2));
             nextButton.Location = new Point(playButton.Right + Theme.S(10), prevButton.Top);
             stopButton.Location = new Point(nextButton.Right + Theme.S(6), prevButton.Top);
+            shuffleButton.Location = new Point(prevButton.Left - Theme.S(6) - shuffleButton.Width, prevButton.Top);
             int seekW = Math.Min(Theme.S(560), transport.Width - Theme.S(560));
             seekW = Math.Max(Theme.S(200), seekW);
             int sy = playButton.Bottom + Theme.S(6);
@@ -130,7 +152,7 @@ namespace Discphew.UI
             timeLeft.TextAlign = ContentAlignment.MiddleRight;
             seek.SetBounds(cx - seekW / 2, sy, seekW, seek.Height);
             timeRight.SetBounds(seek.Right + Theme.S(6), sy - Theme.S(2), Theme.S(48), seek.Height + Theme.S(4));
-            int textW = Math.Max(10, prevButton.Left - pad - Theme.S(20));
+            int textW = Math.Max(10, shuffleButton.Left - pad - Theme.S(20));
             nowTitle.SetBounds(pad, h / 2 - nowTitle.Height, textW, nowTitle.Height);
             nowArtist.SetBounds(pad, h / 2, textW, nowArtist.Height);
             volume.SetBounds(transport.Width - pad - Theme.S(120), (h - volume.Height) / 2, Theme.S(120), volume.Height);
@@ -163,6 +185,12 @@ namespace Discphew.UI
                 artistLabel.Text = s.Artist;
                 infoLabel.Text = string.Join("  ·  ", new[] { s.Year, $"{s.Tracks.Count} tracks", Fmt.Time(TimeSpan.FromSeconds(s.TotalFrames / (double)s.SampleRate)), s.SampleRate != 44100 ? $"{s.SampleRate / 1000.0:0.#} kHz" : "" }.Where(x => !string.IsNullOrEmpty(x)));
                 cover.LoadBytes(s.Cover);
+                if (s.Cover == null)
+                    FindCover(s.Artist, s.Album, bytes =>
+                    {
+                        if (s.IsDisc && d != null) MetadataCache.SaveCover(d, bytes);
+                        if (ReferenceEquals(source, s)) cover.LoadBytes(bytes);
+                    });
                 foreach (var t in s.Tracks) grid.Rows.Add("", t.Number.ToString(), t.Title, t.Artist, Fmt.Time(t.Duration(s.SampleRate)));
             }
             else if (d != null && d.HasAudio)
@@ -171,6 +199,12 @@ namespace Discphew.UI
                 artistLabel.Text = d.AlbumArtist;
                 infoLabel.Text = $"{(d.Year.Length > 0 ? d.Year + "  ·  " : "")}{d.AudioTracks.Count()} tracks  ·  {Fmt.Time(d.AudioDuration)}";
                 cover.LoadFile(d.CoverPath);
+                if (cover.Image == null)
+                    FindCover(d.AlbumArtist, d.AlbumTitle, bytes =>
+                    {
+                        MetadataCache.SaveCover(d, bytes);
+                        if (ReferenceEquals(State.Disc, d) && (source == null || source.IsDisc)) cover.LoadBytes(bytes);
+                    });
                 foreach (var t in d.AudioTracks) grid.Rows.Add("", t.Number.ToString(), t.Title.Length > 0 ? t.Title : $"Track {t.Number}", t.Artist, Fmt.Time(t.Duration));
             }
             else
@@ -182,6 +216,24 @@ namespace Discphew.UI
             }
             (Owner as MainForm)?.UpdateHeader();
             UpdateTransport();
+        }
+
+        /// <summary>
+        /// For an album with no art of its own (a burned CD's CD-Text, a folder without a cover): looks the cover
+        /// up on MusicBrainz by name, once per album, and hands it to <paramref name="found"/> on the UI thread.
+        /// </summary>
+        void FindCover(string artist, string album, Action<byte[]> found)
+        {
+            if (string.IsNullOrWhiteSpace(album)) return;
+            string key = artist + "\n" + album;
+            if (foundCovers.TryGetValue(key, out var known)) { if (known != null) found(known); return; }
+            foundCovers[key] = null;
+            Task.Run(() => MusicBrainz.SearchCover(artist, album)).ContinueWith(t =>
+            {
+                if (t.IsFaulted || t.Result == null) return;
+                foundCovers[key] = t.Result;
+                found(t.Result);
+            }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         void LoadDisc(bool autoplay)
@@ -212,21 +264,99 @@ namespace Discphew.UI
 
         void SetSource(IAlbumSource s)
         {
-            source = s;
+            lock (sourceLock)
+            {
+                source = s;
+                order = null;
+                ResetMap(0);
+            }
             currentTrack = -1;
             ShowAlbum(s);
         }
+
+        // ------------------------------------------------------------------ shuffle
+
+        void SetShuffle(bool on, bool remember = true)
+        {
+            shuffle = on;
+            if (remember) Settings.Set("player.shuffle", on ? "1" : "0");
+            lock (sourceLock) order = null;         // Fill deals a fresh order from wherever playback has got to
+            shuffleButton.ForeColor = on ? Theme.Accent : Theme.Text;
+            shuffleButton.Invalidate();
+        }
+
+        /// <summary>Makes <paramref name="track"/> the one playing in the shuffled order: tracks not yet played stay ahead of it. Under sourceLock.</summary>
+        void Promote(int track)
+        {
+            int i = order.IndexOf(track);
+            if (i < 0) return;
+            order.RemoveAt(i);
+            if (i <= orderPos) orderPos--;
+            order.Insert(++orderPos, track);
+        }
+
+        /// <summary>Starts the position map over at <paramref name="sourceFrame"/> (after a flush, or with a new source). Under sourceLock.</summary>
+        void ResetMap(long sourceFrame)
+        {
+            jumps.Clear();
+            jumps.Add((0, sourceFrame));
+            produced = 0;
+            if (order != null && source != null) Promote(TrackAt(sourceFrame));
+        }
+
+        /// <summary>The source frame behind the <paramref name="output"/>th frame handed to the player since the last flush. Under sourceLock.</summary>
+        long SourceFrame(long output)
+        {
+            int i = jumps.Count - 1;
+            while (i > 0 && jumps[i].output > output) i--;
+            return jumps[i].source + (output - jumps[i].output);
+        }
+
+        long TrackEnd(int i) => i + 1 < source.Tracks.Count ? source.Tracks[i + 1].StartFrame : source.TotalFrames;
 
         // ------------------------------------------------------------------ transport
 
         int Fill(byte[] buffer, int count)
         {
-            int n;
+            int n = 0;
             lock (sourceLock)
             {
                 if (source == null) return 0;
-                try { n = source.Read(buffer, count); }
-                catch { return 0; }
+                try
+                {
+                    if (shuffle && order == null && source.Tracks.Count > 0)
+                    {
+                        int first = TrackAt(SourceFrame(produced));
+                        order = new List<int> { first };
+                        order.AddRange(Enumerable.Range(0, source.Tracks.Count).Where(i => i != first).OrderBy(_ => rng.Next()));
+                        orderPos = 0;
+                    }
+                    while (n < count)
+                    {
+                        int want = count - n;
+                        if (order != null)
+                        {
+                            // Play to the last sample of this track, then carry straight on from the start of the next one in the order.
+                            long at = SourceFrame(produced), end = TrackEnd(order[orderPos]);
+                            if (at >= end)
+                            {
+                                if (orderPos + 1 >= order.Count) break;
+                                long next = source.Tracks[order[++orderPos]].StartFrame;
+                                source.Seek(next);
+                                jumps.Add((produced, next));
+                                continue;
+                            }
+                            want = (int)Math.Min(want, (end - at) * 4);
+                        }
+                        if (scratch.Length < want) scratch = new byte[count];
+                        int got = source.Read(scratch, want);
+                        if (got <= 0) break;
+                        Buffer.BlockCopy(scratch, 0, buffer, n, got);
+                        n += got;
+                        produced += got / 4;
+                    }
+                }
+                catch { if (n == 0) return 0; }
             }
             double g = gain;
             if (g < 0.999)
@@ -282,6 +412,8 @@ namespace Discphew.UI
             lock (sourceLock)
             {
                 source?.Seek(0);
+                order = null;
+                ResetMap(0);
                 if (release) { source?.Dispose(); source = null; }
             }
             seek.Value = 0;
@@ -296,14 +428,15 @@ namespace Discphew.UI
         {
             if (source == null) return;
             frame = Math.Max(0, Math.Min(source.TotalFrames - 1, frame));
+            void Restart() { lock (sourceLock) { source.Seek(frame); ResetMap(frame); } }
             if (player == null)
             {
                 lock (sourceLock) source.Seek(frame);
                 EnsurePlayer();
-                player?.Flush(frame, () => source.Seek(frame));
+                player?.Flush(frame, Restart);
                 Play();
             }
-            else player.Flush(frame, () => source.Seek(frame));
+            else player.Flush(frame, Restart);
             UpdatePosition();
         }
 
@@ -315,7 +448,16 @@ namespace Discphew.UI
             if (!playing) Play();
         }
 
-        long Position => player?.PositionFrames ?? 0;
+        /// <summary>Where in the album the audio being heard comes from.</summary>
+        long Position
+        {
+            get
+            {
+                if (player == null) return 0;
+                long played = player.PositionFrames;
+                lock (sourceLock) return SourceFrame(played - jumps[0].source);    // the player counts from the flush's base
+            }
+        }
 
         int TrackAt(long frame)
         {
@@ -331,7 +473,19 @@ namespace Discphew.UI
             long pos = Position;
             int i = TrackAt(pos);
             // Like a CD player: restart the track unless we're within the first 3 seconds.
-            if (i > 0 && pos - source.Tracks[i].StartFrame < source.SampleRate * 3) i--;
+            bool back = pos - source.Tracks[i].StartFrame < source.SampleRate * 3;
+            lock (sourceLock)
+            {
+                int p = order?.IndexOf(i) ?? -1;
+                if (p >= 0)
+                {
+                    // Shuffled: step back through the order played so far.
+                    if (back && p > 0) { orderPos = p - 1; i = order[p - 1]; }
+                    else orderPos = p;
+                    back = false;
+                }
+            }
+            if (back && i > 0) i--;
             PlayTrack(Math.Max(0, i));
         }
 
@@ -339,7 +493,13 @@ namespace Discphew.UI
         {
             if (source == null) return;
             int i = TrackAt(Position);
-            if (i + 1 < source.Tracks.Count) PlayTrack(i + 1);
+            lock (sourceLock)
+            {
+                int p = order?.IndexOf(i) ?? -1;
+                if (p >= 0) { if (p + 1 < order.Count) { orderPos = p; i = order[p + 1]; } else return; }
+                else i++;
+            }
+            if (i < source.Tracks.Count) PlayTrack(i);
         }
 
         void UpdatePosition()
@@ -428,6 +588,7 @@ namespace Discphew.UI
                 case Keys.Left: if (source != null) SeekTo(Position - source.SampleRate * 5); return true;
                 case Keys.Control | Keys.Right: Next(); return true;
                 case Keys.Control | Keys.Left: Previous(); return true;
+                case Keys.S: SetShuffle(!shuffle); return true;
             }
             return false;
         }

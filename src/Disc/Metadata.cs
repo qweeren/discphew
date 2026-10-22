@@ -158,6 +158,47 @@ namespace Discphew.Disc
             return null;
         }
 
+        /// <summary>
+        /// Front cover for an album known only by name (CD-Text, tags): searches MusicBrainz releases and takes
+        /// the first close match the Cover Art Archive has art for. Null if there's none or the lookup fails.
+        /// </summary>
+        public static byte[] SearchCover(string artist, string album)
+        {
+            if (string.IsNullOrWhiteSpace(album)) return null;
+            static string Phrase(string s) => "\"" + s.Trim().Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            string query = "release:" + Phrase(album) + (string.IsNullOrWhiteSpace(artist) || artist == "Various Artists" ? "" : " AND artist:" + Phrase(artist));
+            try
+            {
+                string json = null;
+                for (int attempt = 0; json == null; attempt++)
+                {
+                    try
+                    {
+                        using var wc = Client();
+                        wc.Headers[HttpRequestHeader.Accept] = "application/json";
+                        json = wc.DownloadString("https://musicbrainz.org/ws/2/release/?limit=10&fmt=json&query=" + Uri.EscapeDataString(query));
+                    }
+                    catch (WebException e) when ((e.Response as HttpWebResponse)?.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < 3)
+                    {
+                        System.Threading.Thread.Sleep(1500 * (attempt + 1));    // rate limit
+                    }
+                }
+                var root = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(json) as Dictionary<string, object>;
+                // Releases of one album share a release group; try each group once, best-scoring first.
+                var tried = new HashSet<string>();
+                foreach (var rel in A(root, "releases").Where(r => int.TryParse(S(r, "score"), out int score) && score >= 90).Take(5))
+                {
+                    var m = new ReleaseMatch { Id = S(rel, "id"), ReleaseGroupId = S(O(rel, "release-group"), "id") };
+                    if (!tried.Add(m.ReleaseGroupId.Length > 0 ? m.ReleaseGroupId : m.Id)) continue;
+                    var cover = FetchCover(m);
+                    if (cover != null) return cover;
+                }
+            }
+            catch (WebException) { }
+            catch (ArgumentException) { }       // malformed JSON
+            return null;
+        }
+
         public static void Apply(DiscInfo d, ReleaseMatch r)
         {
             d.AlbumTitle = r.Title;

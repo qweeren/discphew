@@ -281,20 +281,24 @@ namespace Discphew.Disc
         }
 
         /// <summary>Raw disc-at-once progress. <paramref name="starts"/> holds each track's first LBA, then the lead-out's.</summary>
-        static void ReportRaw(BurnOptions o, object args, long[] starts)
+        static void ReportRaw(BurnOptions o, object args, long[] starts, System.Diagnostics.Stopwatch clock)
         {
             if (o.Progress == null) return;
             int action = Com.GetOr(args, "CurrentAction", -1);
             long start = Com.GetOr(args, "StartLba", 0L), count = Com.GetOr(args, "SectorCount", 0L), last = Com.GetOr(args, "LastWrittenLba", 0L);
             int tracks = starts.Length - 1, track = starts.Take(tracks).Count(s => s <= last);
             string writing = last < 0 ? "Writing the lead-in" : last >= starts[tracks] ? "Writing the lead-out" : $"Writing track {track} of {tracks}";
+            double frac = action == 2 && count > 0 ? Math.Max(0, Math.Min(1, (last - start) / (double)count)) : -1;
+            if (action == 2 && !clock.IsRunning) clock.Start();
+            double elapsed = clock.Elapsed.TotalSeconds;
             o.Progress(new BurnProgress
             {
                 // Raw CD: 0 unknown, 1 preparing, 2 writing, 3 finishing
                 Phase = action switch { 1 => "Preparing", 2 => writing, 3 => "Finishing", _ => "Working" },
-                Fraction = action == 2 && count > 0 ? Math.Max(0, Math.Min(1, (last - start) / (double)count)) : -1,
-                ElapsedSeconds = Com.GetOr(args, "ElapsedTime", 0),
-                RemainingSeconds = Com.GetOr(args, "RemainingTime", -1),
+                Fraction = frac,
+                ElapsedSeconds = (int)elapsed,
+                // The raw writer's own RemainingTime never moves, so estimate it from the rate so far.
+                RemainingSeconds = frac > 0.03 && elapsed > 5 ? (int)(elapsed * (1 - frac) / frac) : -1,
             });
         }
 
@@ -429,6 +433,7 @@ namespace Discphew.Disc
             IStream subcode = null;
             IConnectionPoint cp = null; int cookie = 0;
             bool prepared = false;
+            string step = "checking the drive and disc";
             try
             {
                 if (!(bool)Com.Call(raw, "IsRecorderSupported", rec)) return null;
@@ -443,30 +448,38 @@ namespace Discphew.Disc
 
                 var starts = new long[pcmFiles.Count + 1];
                 for (int i = 0; i < pcmFiles.Count; i++) starts[i + 1] = starts[i] + new FileInfo(pcmFiles[i]).Length / 2352;
-                long limit = Com.GetOr(raw, "LastPossibleStartOfLeadout", 0L);
-                if (limit > 0 && starts[pcmFiles.Count] > limit) throw new DiscException($"Those tracks need {Fmt.Time(TimeSpan.FromSeconds(starts[pcmFiles.Count] / 75.0))} but the disc only has {Fmt.Time(TimeSpan.FromSeconds(limit / 75.0))}.");
 
+                step = "laying out the disc image";
                 o.Progress?.Invoke(new BurnProgress { Phase = "Laying out the disc" });
                 if (withText) subcode = CdTextSubcode(pcmFiles, cdText, streams);
                 creator = CreateRawImage(type, pcmFiles, subcode, streams, out image);
                 SetSpeed(raw, o.Speed);
 
-                var sink = new WriteEventSink { OnUpdate = a => ReportRaw(o, a, starts) };
+                var clock = new System.Diagnostics.Stopwatch();
+                var sink = new WriteEventSink { OnUpdate = a => ReportRaw(o, a, starts, clock) };
                 cookie = Advise(raw, RawEventsIid, sink, out cp);
                 activeWriter = raw; activeCancelMethod = "CancelWrite";
 
+                // Most of the raw writer's properties only answer once the disc is prepared (locked for this burn).
+                step = "preparing the disc";
                 o.Progress?.Invoke(new BurnProgress { Phase = "Preparing the disc" });
                 Com.Call(raw, "PrepareMedia");
                 prepared = true;
+                step = "choosing the write mode";
                 Com.Set(raw, "RequestedSectorType", type);
+                step = "measuring the disc";
+                long limit = Com.GetOr(raw, "LastPossibleStartOfLeadout", 0L);
+                if (limit > 0 && starts[pcmFiles.Count] > limit) throw new DiscException($"Those tracks need {Fmt.Time(TimeSpan.FromSeconds(starts[pcmFiles.Count] / 75.0))} but the disc only has {Fmt.Time(TimeSpan.FromSeconds(limit / 75.0))}.");
+                step = "writing";
                 Com.Call(raw, "WriteMedia", image);
+                step = "closing the disc";
                 o.Progress?.Invoke(new BurnProgress { Phase = "Closing the disc" });
                 Com.Call(raw, "ReleaseMedia");
                 prepared = false;
                 Finish(o, rec);
                 return withText ? AudioBurnMode.DiscAtOnceWithCdText : AudioBurnMode.DiscAtOnce;
             }
-            catch (COMException e) { throw Translate(e); }
+            catch (COMException e) { throw Translate(e, step); }
             finally
             {
                 activeWriter = null;
@@ -620,19 +633,21 @@ namespace Discphew.Disc
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         static extern int FormatMessage(uint flags, IntPtr source, uint id, uint lang, StringBuilder buffer, int size, IntPtr args);
 
-        public static Exception Translate(COMException e)
+        /// <summary>IMAPI's own wording for an error, plus (when given) the step it failed at and the code, so a report pins it down.</summary>
+        public static Exception Translate(COMException e, string step = null)
         {
             uint hr = unchecked((uint)e.ErrorCode);
             if (hr == 0xC0AA0002) return new OperationCanceledException("Cancelled.");
+            string detail = step == null ? "" : $"\n\n(While {step}: 0x{hr:X8}.)";
             foreach (var dll in new[] { "imapi2.dll", "imapi2fs.dll" })
             {
                 var mod = LoadLibraryEx(dll, IntPtr.Zero, 0x2);
                 if (mod == IntPtr.Zero) continue;
                 var sb = new StringBuilder(1024);
                 if (FormatMessage(0x800 | 0x200, mod, hr, 0, sb, sb.Capacity, IntPtr.Zero) > 0)
-                    return new DiscException(sb.ToString().Trim(), e);
+                    return new DiscException(sb.ToString().Trim() + detail, e);
             }
-            return new DiscException(e.Message, e);
+            return new DiscException(e.Message + detail, e);
         }
     }
 }
