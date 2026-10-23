@@ -213,6 +213,16 @@ namespace Discphew.UI
             g.DrawLines(pen, new[] { Pt(0.72f, 0.6f), Pt(0.88f, 0.72f), Pt(0.72f, 0.84f) });
         }
 
+        /// <summary>A jewel case: the hinge down its left edge and the disc showing through.</summary>
+        public static void Case(Graphics g, RectangleF r, Color c)
+        {
+            using var pen = P(c, r, 0.08f);
+            var o = Inset(r, 0.12f);
+            using (var path = Theme.Round(o, r.Width * 0.08f)) g.DrawPath(pen, path);
+            g.DrawLine(pen, o.X + o.Width * 0.22f, o.Y, o.X + o.Width * 0.22f, o.Bottom);
+            g.DrawEllipse(pen, o.X + o.Width * 0.4f, o.Y + o.Height * 0.27f, o.Width * 0.46f, o.Height * 0.46f);
+        }
+
         public static void Eject(Graphics g, RectangleF r, Color c)
         {
             float x = r.X, y = r.Y, w = r.Width, h = r.Height;
