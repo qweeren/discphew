@@ -16,6 +16,7 @@ Made for old-heads, retro lovers and collectors who still use discs today, espec
 | **Burner** | Data discs (drag in files and folders; ISO 9660 + Joliet + UDF, multisession-aware), audio CDs (FLAC/WAV, or anything ffmpeg reads; hi-res files are resampled and dithered to CD quality; one file per track or a whole-album file with its .cue sheet; written disc-at-once, gapless, with CD-Text from the tags or cue sheet), and ISO images. Speed choice, capacity bar, erase for RW discs. |
 | **Ripper** | Audio CDs to FLAC or WAV with no extra software (ALAC, MP3, AAC, Opus and Vorbis if ffmpeg is installed). Two-pass verified reads with cache-defeating re-reads, drive read-offset correction (remembered per drive, or detected with any CD that's in AccurateRip), AccurateRip v1/v2 verification with confidence per track, CRC32 per track, cue sheet and rip log, MusicBrainz metadata, Cover Art Archive artwork and CD-Text. Data discs: exact ISO image or a file copy, optionally converting video (DVD titles → MP4/MOV/MKV) through ffmpeg. |
 | **Album Player** | Plays a CD as an album: straight off the disc, gapless, pregaps and hidden tracks included, with the cover and track list. Also plays a folder of FLAC/WAV files the same way. Space = play/pause, ←/→ = seek, Ctrl+←/→ = previous/next track. |
+| **Cover Printer** | Print-ready jewel case inserts for the CD in the drive or an album folder. It finds the exact release from the files' `MUSICBRAINZ_ALBUMID` tag, else from the disc ID (a folder of lossless tracks gets the disc ID of the CD it was ripped from), else by searching on the name, for you to pick from. It fetches the release's scans from the Cover Art Archive (front, back, disc, booklet pages), falling back to the album's other pressings and, for a missing or small front, a 3000 px one from iTunes. Parts: front booklet (120 × 120 mm), tray inlay with spines (151 × 118 mm) and disc label (118 mm). A back inlay with no scan is generated from the track list and running times over a blur of the front. Drag, zoom and straighten crooked scans in the preview, then export a PDF at 300 DPI with 3 mm bleed, crop marks and fold marks. With *Full booklet*, the scanned booklet pages are imposed onto folding sheets to print double-sided. |
 
 ## Requirements
 
@@ -37,7 +38,7 @@ build.cmd -Debug   :: debug build with symbols
 
 `tools\make-icon.ps1` regenerates `assets\discphew.ico`.
 
-`tests\run-tests.ps1` checks the AccurateRip disc IDs, response parsing and v1/v2 checksums against the published vectors from [whipper](https://github.com/whipper-team/whipper) and [arver](https://github.com/arcctgx/arver) (their sample files are downloaded into `bin\testdata` on first run), and the offset correction against a simulated drive.
+`tests\run-tests.ps1` checks the AccurateRip disc IDs, response parsing and v1/v2 checksums against the published vectors from [whipper](https://github.com/whipper-team/whipper) and [arver](https://github.com/arcctgx/arver) (their sample files are downloaded into `bin\testdata` on first run), and the offset correction against a simulated drive. It also checks the MusicBrainz disc ID of files against MusicBrainz's documented example, booklet imposition, and the cover templates and PDF structure.
 
 ## How it's put together
 
@@ -49,13 +50,17 @@ src/
   Disc/Imapi.cs            Burning, erasing and media detection via IMAPI2 (late-bound COM)
   Disc/Ripper.cs           Verified, offset-corrected audio ripping, cue/log, offset detection, ISO imaging, file copy
   Disc/AccurateRip.cs      AccurateRip disc IDs, database lookup, v1/v2 track checksums
-  Disc/Metadata.cs         MusicBrainz disc ID + lookup, Cover Art Archive, local cache
+  Disc/Metadata.cs         MusicBrainz disc ID + lookup (rate-limited), release search, local cache
+  Disc/CoverArt.cs         Cover Art Archive image lists, iTunes front covers, download cache
   Audio/FlacEncoder.cs     FLAC encoder (fixed + LPC prediction, partitioned Rice, stereo decorrelation)
   Audio/FlacReader.cs      FLAC decoder with seeking
   Audio/AudioIO.cs         WAV I/O, optional ffmpeg bridge, resampler, conversion to CD audio
   Audio/AlbumSource.cs     Disc and folder sources for gapless album playback
   Audio/CueSheet.cs        Cue sheet parser (tracks as spans of their source files)
   Audio/WavePlayer.cs      waveOut output
+  Print/CoverAlbum.cs      An album for printing: track list, TOC and release ID from a disc or folder
+  Print/CoverRender.cs     Insert templates, generated back inlay, booklet imposition, page layout
+  Print/PdfWriter.cs       Minimal PDF writer (JPEG images, crop marks, Helvetica captions)
   UI/                      Dark, DPI-aware WinForms UI with hand-drawn controls and icons
 ```
 
@@ -73,6 +78,7 @@ The FLAC encoder output decodes bit-identically with libsndfile/libFLAC, and its
 - File positions in the visualizer need ISO 9660; UDF-only discs show their file list without positions.
 - Only ISO-style (2048-byte sector) images can be burned; BIN/CUE isn't supported yet.
 - Blu-ray writing isn't available through IMAPI2.
+- Cover Printer: the disc label is sized for standard 118 mm labels with a 41 mm hub. Booklet pages are fitted automatically, so only the front, back inlay and disc label can be nudged. Generated text is printed at 300 DPI, not as vector type.
 
 ## Contributing
 

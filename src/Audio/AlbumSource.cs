@@ -120,6 +120,8 @@ namespace Discphew.Audio
         public long TotalFrames { get; }
         public bool IsDisc => false;
         public string Folder { get; }
+        public string ReleaseId { get; } = "";      // MUSICBRAINZ_ALBUMID, as Picard tags files
+        public int DiscNumber { get; }
 
         public static bool LooksLikeAlbum(string folder) =>
             Directory.Exists(folder) && Directory.EnumerateFiles(folder).Any(AudioFile.IsAudioFile);
@@ -131,7 +133,7 @@ namespace Discphew.Audio
             if (candidates.Count == 0) throw new IOException("No audio files in that folder.");
             var infos = new List<(string path, int number, string title, string artist, long frames, int rate)>();
             byte[] embedded = null;
-            string album = "", albumArtist = "", year = "";
+            string album = "", albumArtist = "", year = "", releaseId = "", discNumber = "";
             foreach (var f in candidates)
             {
                 try
@@ -151,6 +153,8 @@ namespace Discphew.Audio
                     if (albumArtist.Length == 0) albumArtist = r.Tag("ALBUMARTIST").Length > 0 ? r.Tag("ALBUMARTIST") : r.Tag("ARTIST");
                     if (year.Length == 0) year = r.Tag("DATE");
                     if (embedded == null) embedded = r.Picture;
+                    if (releaseId.Length == 0) releaseId = r.Tag("MUSICBRAINZ_ALBUMID");
+                    if (discNumber.Length == 0) discNumber = r.Tag("DISCNUMBER");
                 }
                 catch { }
             }
@@ -177,13 +181,20 @@ namespace Discphew.Audio
             Album = album.Length > 0 ? album : Path.GetFileName(folder);
             Artist = albumArtist;
             Year = year.Length >= 4 ? year.Substring(0, 4) : year;
-            Cover = embedded;
-            if (Cover == null)
-                foreach (var name in new[] { "cover.jpg", "folder.jpg", "front.jpg", "cover.png", "folder.png", "front.png" })
-                {
-                    var p = Path.Combine(folder, name);
-                    if (File.Exists(p)) { try { Cover = File.ReadAllBytes(p); } catch { } break; }
-                }
+            ReleaseId = releaseId;
+            DiscNumber = int.TryParse(discNumber.Split('/')[0], out int disc) ? disc : 0;
+            Cover = embedded ?? CoverFile(folder);
+        }
+
+        /// <summary>The cover image file next to an album's tracks (cover.jpg, folder.jpg…), or null.</summary>
+        public static byte[] CoverFile(string folder)
+        {
+            foreach (var name in new[] { "cover.jpg", "folder.jpg", "front.jpg", "cover.png", "folder.png", "front.png" })
+            {
+                var p = Path.Combine(folder, name);
+                if (File.Exists(p)) { try { return File.ReadAllBytes(p); } catch { } break; }
+            }
+            return null;
         }
 
         void Open(int index, long localFrame)

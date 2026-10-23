@@ -103,7 +103,7 @@ namespace Discphew.UI
             // ---- sidebar
             var sidebar = new Panel { Dock = DockStyle.Left, Width = Theme.S(240), BackColor = Theme.Sidebar };
             var logo = new Logo { Dock = DockStyle.Top };
-            var navPanel = new Panel { Dock = DockStyle.Top, Height = Theme.S(4 * 46 + 16), BackColor = Theme.Sidebar, Padding = new Padding(Theme.S(12), Theme.S(8), Theme.S(12), 0) };
+            var navPanel = new Panel { Dock = DockStyle.Top, Height = Theme.S(5 * 46 + 16), BackColor = Theme.Sidebar, Padding = new Padding(Theme.S(12), Theme.S(8), Theme.S(12), 0) };
 
             var drivePanel = new Panel { Dock = DockStyle.Bottom, Height = Theme.S(196), BackColor = Theme.Sidebar };
             var driveLabel = new Caption("DRIVE", Theme.Small, Theme.Faint) { Bounds = new Rectangle(Theme.S(16), Theme.S(8), Theme.S(200), Theme.S(20)) };
@@ -146,6 +146,7 @@ namespace Discphew.UI
             AddTool(navPanel, "Burn", Icons.Flame, new BurnerView(state));
             AddTool(navPanel, "Rip", Icons.Rip, new RipperView(state));
             AddTool(navPanel, "Play", Icons.Note, new PlayerView(state));
+            AddTool(navPanel, "Covers", Icons.Case, new CoverView(state));
 
             state.Changed += OnStateChanged;
             state.LabelsChanged += () => driveBox.Invalidate();

@@ -28,6 +28,9 @@ namespace Discphew.Tests
             Run("CD-Text in a raw disc-at-once image (IMAPI)", CdTextRawImage);
             Run("cue sheet parsing", CueParsing);
             Run("cue tracks split out of one file", CueSplitting);
+            Run("cover lookups: disc IDs for files, Cover Art Archive listings", CoverLookups);
+            Run("booklet imposition", BookletImposition);
+            Run("cover templates and PDF", CoverPdf);
             Console.WriteLine();
             Console.WriteLine(failed == 0 ? $"All {passed} checks passed." : $"{failed} of {passed + failed} checks FAILED.");
             return failed == 0 ? 0 : 1;
